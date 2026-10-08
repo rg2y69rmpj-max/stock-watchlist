@@ -688,7 +688,14 @@
     updateBadge();
     makeSource(); startRefresh(); route();
     if (src) { refreshAlertQuotes(); setTimeout(checkAlerts, 1500); } // check on app open
-    if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
+    if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+      const hadCtrl = !!navigator.serviceWorker.controller; let reloaded = false;
+      navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadCtrl && !reloaded) { reloaded = true; location.reload(); } });
+      navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(reg => {
+        reg.update().catch(() => {});
+        document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
+      }).catch(() => {});
+    }
   }
   window.__app = { get src() { return src; }, get wl() { return wls.US; }, get wls() { return wls; }, get pf() { return pf; }, get alerts() { return alerts; }, chart, checkAlerts, notifyCount: 0 };
   boot();

@@ -35,7 +35,7 @@ const text = files.filter(f => /\.(js|json|html|css|md|webmanifest|py|txt)$|\.gi
     const assets = JSON.parse(sw.match(/const ASSETS = (\[[\s\S]*?\]);/)[1].replace(/'/g, '"'));
     for (const a of assets) if (a !== './') assert.ok(fs.existsSync(path.join(ROOT, a)), a);
     for (const f of ['index.html', 'app.js', 'logic.js', 'api.js', 'chart.js', 'styles.css', 'data/default-watchlist.json', 'data/asx-watchlist.json']) assert.ok(assets.includes(f), f);
-    assert.ok(/stockwatch-shell-v2/.test(sw) && /stockwatch-data-v2/.test(sw), 'cache version bumped');
+    assert.ok(/stockwatch-shell-v3/.test(sw) && /stockwatch-data-v3/.test(sw), 'cache version bumped');
     for (const p of ['token', 'apikey', 'access_key']) assert.ok(sw.includes("'" + p + "'"), 'SW strips ' + p + ' before caching');
     for (const h of ['finnhub.io', 'api.twelvedata.com', 'api.marketstack.com', 'api.frankfurter.dev']) assert.ok(sw.includes("'" + h + "'"), 'SW knows API host ' + h);
   });

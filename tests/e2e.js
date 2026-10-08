@@ -408,7 +408,7 @@ const visible = (p, sel) => p.$eval(sel, e => !e.hidden && !e.closest('[hidden]'
     // ---------- service worker ----------
     const ctx3 = await browser.createBrowserContext(); const s = await newPage(ctx3, { bypassSW: false });
     await s.goto(BASE, { waitUntil: 'networkidle0' });
-    const swOk = await s.evaluate(async () => { const reg = await navigator.serviceWorker.ready; const ks = await caches.keys(); const c = await caches.open('stockwatch-shell-v2'); return { active: !!reg.active, ks, idx: !!(await c.match('index.html')), list: !!(await c.match('data/default-watchlist.json')) && !!(await c.match('data/asx-watchlist.json')) }; });
+    const swOk = await s.evaluate(async () => { const reg = await navigator.serviceWorker.ready; const ks = await caches.keys(); const c = await caches.open('stockwatch-shell-v3'); return { active: !!reg.active, ks, idx: !!(await c.match('index.html')), list: !!(await c.match('data/default-watchlist.json')) && !!(await c.match('data/asx-watchlist.json')) }; });
     ok(swOk.active && swOk.idx && swOk.list, 'service worker active and app shell cached: ' + swOk.ks.join());
     await s.setOfflineMode(true); await s.reload({ waitUntil: 'domcontentloaded' });
     ok(await s.$('#v-setup') !== null, 'app shell loads offline from the cache');
