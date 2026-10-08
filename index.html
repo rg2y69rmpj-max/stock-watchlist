@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://finnhub.io https://api.twelvedata.com; manifest-src 'self'; worker-src 'self'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#0b0f14">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Watchlist">
+<meta name="format-detection" content="telephone=no">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="styles.css">
+<title>Stock Watchlist</title>
+</head>
+<body>
+<header id="hdr">
+  <button id="back" class="icon" type="button" aria-label="Back" hidden>‹</button>
+  <h1 id="title">Watchlist</h1>
+  <span id="demoBadge" class="badge demo" hidden>DEMO</span>
+  <button id="gear" class="icon" type="button" aria-label="Settings">⚙</button>
+</header>
+<div id="statusBar"><span class="badge delayed" id="delayed">Delayed data</span><span id="asof" class="muted"></span><span id="queue" class="muted"></span></div>
+<div id="demoBanner" class="demo-banner" hidden><b>DEMO</b> · synthetic numbers for trying the app. Not real prices or ratings.</div>
+<div id="banner" class="banner" role="alert" hidden><span id="bannerText"></span><button id="bannerClose" class="icon sm" type="button" aria-label="Dismiss">×</button></div>
+
+<main>
+  <!-- SETUP (no key yet) -->
+  <section id="v-setup" class="view" hidden>
+    <div class="card">
+      <h2>Welcome</h2>
+      <p>This watchlist reads market data straight from free data providers. Each provider needs its own free API key, which you paste in once. Keys are kept only in this browser on this phone.</p>
+      <ol class="steps">
+        <li><b>Finnhub</b> (required): prices, company info, metrics, analyst ratings and earnings dates. Free key at <a href="https://finnhub.io/register" target="_blank" rel="noopener noreferrer">finnhub.io/register</a>.</li>
+        <li><b>Twelve Data</b> (optional): price charts and sparklines. Free key at <a href="https://twelvedata.com/register" target="_blank" rel="noopener noreferrer">twelvedata.com/register</a>.</li>
+      </ol>
+      <form id="setupForm" class="keys" autocomplete="off">
+        <label>Finnhub API key<input name="finnhub" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste key"></label>
+        <label>Twelve Data API key (optional)<input name="twelvedata" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste key"></label>
+        <button class="primary" type="submit">Save and load watchlist</button>
+      </form>
+      <div class="or">or</div>
+      <button id="tryDemo" class="ghost wide" type="button">Try with DEMO data</button>
+      <p class="muted small">DEMO mode uses made-up numbers and is labelled DEMO on every screen.</p>
+    </div>
+  </section>
+
+  <!-- LIST -->
+  <section id="v-list" class="view" hidden>
+    <div class="toolbar">
+      <input id="search" type="search" placeholder="Search ticker or company" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Search">
+    </div>
+    <div class="toolbar">
+      <select id="sortKey" aria-label="Sort by">
+        <option value="marketCap">Market cap</option>
+        <option value="symbol">Ticker</option>
+        <option value="changePct">% change</option>
+        <option value="price">Price</option>
+      </select>
+      <button id="sortDir" class="chip" type="button" aria-label="Sort direction">↓</button>
+      <button id="favFirst" class="chip" type="button" aria-pressed="false">★ first</button>
+      <span class="grow"></span>
+      <button id="refresh" class="chip" type="button" aria-label="Refresh">↻</button>
+      <button id="editBtn" class="chip" type="button" aria-pressed="false">Edit</button>
+      <button id="addBtn" class="chip accent" type="button">＋</button>
+    </div>
+    <form id="addForm" class="toolbar addform" hidden autocomplete="off">
+      <input id="addInput" placeholder="Ticker, e.g. IBM" autocapitalize="characters" autocomplete="off" spellcheck="false" aria-label="Ticker to add">
+      <button class="primary sm" type="submit">Add</button>
+      <button id="addCancel" class="ghost sm" type="button">Cancel</button>
+    </form>
+    <div id="addMsg" class="small muted pad"></div>
+    <div class="list-head"><span></span><span>Ticker</span><span class="c">1M</span><span class="r">Price · Day</span></div>
+    <ul id="list" class="list"></ul>
+    <p id="listEmpty" class="muted pad" hidden>No matches.</p>
+    <p id="listNote" class="muted small pad"></p>
+  </section>
+
+  <!-- DETAIL -->
+  <section id="v-detail" class="view" hidden>
+    <div class="d-head">
+      <div class="grow">
+        <div id="dName" class="muted"></div>
+        <div id="dPrice" class="big"></div>
+        <div id="dChange"></div>
+        <div id="dRangeChange" class="small muted"></div>
+      </div>
+      <button id="dFav" class="star big-star" type="button" aria-label="Favourite">☆</button>
+    </div>
+    <div id="chartTip" class="tip small">Touch and drag on the chart to see price and date</div>
+    <div class="chart-wrap"><canvas id="chart" aria-label="Price chart"></canvas></div>
+    <div id="ranges" class="ranges" role="tablist"></div>
+    <div id="chartMsg" class="small muted pad"></div>
+
+    <div class="card"><h2>Analyst ratings</h2><div id="ratings"></div></div>
+    <div class="card"><h2>Price targets</h2><div id="targets"></div></div>
+    <div class="card"><h2>Key metrics</h2><dl id="metrics" class="metrics"></dl></div>
+    <button id="dRemove" class="danger wide" type="button">Remove from watchlist</button>
+  </section>
+
+  <!-- SETTINGS -->
+  <section id="v-settings" class="view" hidden>
+    <div class="card">
+      <h2>API keys</h2>
+      <p class="small muted">Saved only in this browser's localStorage on this device and sent only to the provider it belongs to. They are never written to any file.</p>
+      <form id="keysForm" class="keys" autocomplete="off">
+        <label>Finnhub API key<input name="finnhub" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Not set"></label>
+        <label>Twelve Data API key (charts, optional)<input name="twelvedata" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Not set"></label>
+        <label class="check"><input type="checkbox" id="showKeys"> Show keys</label>
+        <div class="row"><button class="primary grow" type="submit">Save keys</button><button id="clearKeys" class="ghost" type="button">Remove keys</button></div>
+        <div id="keysMsg" class="small muted"></div>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Data</h2>
+      <label class="check"><input type="checkbox" id="demoToggle"> Use DEMO data (synthetic, clearly labelled)</label>
+      <label>Auto-refresh prices
+        <select id="refreshSel"><option value="60">Every minute</option><option value="120">Every 2 minutes</option><option value="300">Every 5 minutes</option><option value="0">Off (tap ↻)</option></select>
+      </label>
+      <div id="usage" class="small muted"></div>
+    </div>
+    <div class="card">
+      <h2>Watchlist</h2>
+      <p class="small muted" id="defaultInfo"></p>
+      <div class="row"><button id="resetList" class="ghost grow" type="button">Reset list to default</button><button id="clearCache" class="ghost grow" type="button">Clear cached data</button></div>
+      <div id="listMsg" class="small muted"></div>
+    </div>
+    <div class="card small">
+      <h2>About the data</h2>
+      <p><b>Finnhub free</b> (60 calls/min): quote, company profile, basic financials, recommendation trends, earnings calendar. Price targets and candles are premium, so price targets show <i>n/a (not on free tier)</i>.</p>
+      <p><b>Twelve Data free</b> (8 credits/min, 800/day): price history for the chart and the 1-month sparklines. 1M, 6M and 1Y share one daily series.</p>
+      <p>Responses are cached on this device: quotes 1 min, metrics and ratings 12 h, profiles 7 days, charts 5 min (1D) to 24 h (5Y). Data may be delayed. Not financial advice.</p>
+    </div>
+  </section>
+</main>
+<footer id="foot">Not financial advice · Delayed data</footer>
+<script src="logic.js"></script>
+<script src="api.js"></script>
+<script src="chart.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
