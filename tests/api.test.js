@@ -4,20 +4,21 @@ const L = require('../logic.js');
 const A = require('../api.js');
 const mocks = require('./mocks.js');
 const { memStorage, clock, test, summary } = require('./helpers.js');
-const FH_KEY = 'FAKE_FINNHUB_KEY_FOR_TESTS', TD_KEY = 'FAKE_TWELVE_KEY_FOR_TESTS';
+const FH_KEY = 'FAKE_FINNHUB_KEY_FOR_TESTS', TD_KEY = 'FAKE_TWELVE_KEY_FOR_TESTS', MS_KEY = 'FAKE_MARKETSTACK_KEY_FOR_TESTS';
 
 function setup(o = {}) {
   const st = memStorage(), c = clock(), calls = [], events = [];
-  const state = { finnhubLimit: false, twelveLimit: false, fail: false };
+  const state = { finnhubLimit: false, twelveLimit: false, marketstackLimit: false, frankfurterDown: false, fail: false };
   const fetch = async (url, init) => {
     calls.push({ url, t: c.now(), auth: init && init.headers && init.headers.Authorization });
     if (state.fail) throw new TypeError('Failed to fetch');
-    const r = mocks.respond(url, { ...state, authorization: init && init.headers && init.headers.Authorization });
+    const r = mocks.respond(url, { ...state, now: c.now(), authorization: init && init.headers && init.headers.Authorization });
     return { ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => r.body };
   };
-  const keys = { finnhub: FH_KEY, twelvedata: TD_KEY, ...(o.keys || {}) };
-  const src = A.createDataSource({ storage: st, fetch, now: c.now, sleep: c.sleep, getKeys: () => keys, onEvent: (t, i) => events.push({ t, ...i }) });
-  return { st, c, calls, events, state, src, keys };
+  const keys = { finnhub: FH_KEY, twelvedata: TD_KEY, marketstack: MS_KEY, ...(o.keys || {}) };
+  const cap = { v: o.cap ?? 100 };
+  const src = A.createDataSource({ storage: st, fetch, now: c.now, sleep: c.sleep, getKeys: () => keys, onEvent: (t, i) => events.push({ t, ...i }), marketstackCap: () => cap.v });
+  return { st, c, calls, events, state, src, keys, cap, fetch };
 }
 
 (async () => {
@@ -142,6 +143,101 @@ function setup(o = {}) {
     assert.deepStrictEqual((await d.priceTarget('AAPL')).value, { unavailable: 'premium' });
     assert.ok(Math.abs(L.marketCap(q1, (await d.profile('AAPL')).value) / 4.9e12 - 1) < 1e-6);
     assert.ok(L.consensus((await d.recommendation('AAPL')).value) !== undefined);
+  });
+  /* ---------- turn 2 ---------- */
+  await test('Marketstack: key only in access_key, every symbol counts against the monthly budget, chunked, cached until the next close', async () => {
+    const { src, calls, c } = setup();
+    const codes = Array.from({ length: 30 }, (_, i) => 'A' + String(i).padStart(2, '0'));
+    assert.strictEqual(src.asxCost(codes), 30);
+    const r = await src.asxQuotes(codes); assert.strictEqual(r.requested, 30);
+    const ms = calls.filter(x => x.url.startsWith('https://api.marketstack.com/v2/eod?'));
+    assert.strictEqual(ms.length, 2, '25 + 5 symbols per call'); assert.ok(ms[0].url.includes('symbols=A00.AX%2CA01.AX')); assert.ok(ms[0].url.endsWith('&access_key=' + MS_KEY));
+    assert.deepStrictEqual(src.asxBudget(), { used: 30, cap: 100, left: 70, month: '2026-10' });
+    const q = src.peekAsxQuote('A05'); assert.strictEqual(q.eod, true); assert.ok(L.isNum(q.price) && L.isNum(q.changePct));
+    await src.asxQuotes(codes); assert.strictEqual(calls.length, 2, 'served from cache'); assert.strictEqual(src.asxCost(codes), 0);
+    c.advance(15 * 3600e3); assert.strictEqual(src.asxCost(codes), 0, 'still fresh before 6 pm Sydney');
+    c.advance(2 * 3600e3); assert.strictEqual(src.asxCost(codes.slice(0, 3)), 3, 'stale once the next close is out');
+  });
+  await test('Marketstack: refuses to go over the monthly budget (no call made) and resets next month', async () => {
+    const { src, calls, c, cap } = setup({ cap: 5 });
+    await assert.rejects(src.asxQuotes(['BHP', 'CBA', 'NAB', 'WBC', 'ANZ', 'MQG']), e => e.type === 'budget' && /0\/5/.test(e.message));
+    assert.strictEqual(calls.length, 0);
+    await src.asxQuotes(['BHP', 'CBA']); assert.strictEqual(src.asxBudget().left, 3);
+    await src.asxHistory('CSL'); assert.strictEqual(src.asxBudget().used, 3, 'history = 1 request');
+    await assert.rejects(src.asxQuotes(['NAB', 'WBC', 'ANZ']), e => e.type === 'budget');
+    cap.v = 100; await src.asxQuotes(['NAB']); assert.strictEqual(src.asxBudget().used, 4, 'cap is read live from settings');
+    c.advance(25 * 864e5); assert.strictEqual(src.asxBudget().used, 0, 'new calendar month');
+  });
+  await test('Marketstack: monthly limit from the server marks the budget used; unknown ticker cached as not found; missing key', async () => {
+    const t = setup();
+    await t.src.asxQuotes(['ZZZ']); assert.deepStrictEqual(t.src.peekAsxQuote('ZZZ'), { notFound: true });
+    t.state.marketstackLimit = true;
+    await assert.rejects(t.src.asxQuotes(['BHP']), e => e.type === 'rate-limit' && e.monthly);
+    assert.strictEqual(t.src.asxBudget().left, 0); assert.ok(t.events.some(e => e.t === 'limit' && e.provider === 'marketstack'));
+    const n = setup({ keys: { marketstack: '' } });
+    await assert.rejects(n.src.asxHistory('BHP'), e => e.type === 'nokey' && /Marketstack/.test(e.message)); assert.strictEqual(n.calls.length, 0);
+  });
+  await test('ASX history: ~1 year of closes, also fills the quote; cached until the next close', async () => {
+    const { src, calls, c } = setup();
+    const r = await src.asxHistory('FANG');
+    assert.ok(r.value.length > 240 && r.value.length < 270, String(r.value.length)); assert.ok(r.value[0].d < r.value.at(-1).d);
+    assert.ok(calls[0].url.includes('symbols=FANG.AX') && calls[0].url.includes('date_from=2025-10-0'));
+    assert.strictEqual(src.peekAsxQuote('FANG').price, r.value.at(-1).c);
+    await src.asxHistory('FANG'); assert.strictEqual(calls.length, 1); c.advance(17 * 3600e3); await src.asxHistory('FANG'); assert.strictEqual(calls.length, 2);
+  });
+  await test('FX: live Twelve Data rate (10 min cache), falls back to Frankfurter ECB rate, Frankfurter alone without a TD key', async () => {
+    const a = setup();
+    const r = await a.src.fx(); assert.strictEqual(r.value.rate, 1.5); assert.strictEqual(r.value.live, true); assert.strictEqual(r.value.source, 'Twelve Data');
+    assert.ok(a.calls[0].url.startsWith('https://api.twelvedata.com/exchange_rate?symbol=USD%2FAUD')); assert.strictEqual(a.calls[0].auth, 'apikey ' + TD_KEY);
+    await a.src.fx(); assert.strictEqual(a.calls.length, 1); a.c.advance(11 * 60e3); await a.src.fx(); assert.strictEqual(a.calls.length, 2);
+    const b = setup(); b.state.twelveLimit = true;
+    const fb = await b.src.fx(); assert.strictEqual(fb.value.rate, 1.4); assert.strictEqual(fb.value.live, false); assert.strictEqual(fb.value.date, '2026-10-07');
+    assert.ok(b.calls[1].url.startsWith('https://api.frankfurter.dev/v1/latest?base=USD&symbols=AUD')); assert.strictEqual(b.calls[1].auth, undefined);
+    const n = setup({ keys: { twelvedata: '' } });
+    const nr = await n.src.fx(); assert.strictEqual(nr.value.source, 'ECB reference rate (Frankfurter)'); assert.strictEqual(n.calls.length, 1);
+    n.c.advance(3 * 3600e3); await n.src.fx(); assert.strictEqual(n.calls.length, 1, 'ECB rate cached 6 h'); assert.strictEqual(n.src.usage().frToday, 1);
+    const d = setup({ keys: { twelvedata: '' } }); d.state.frankfurterDown = true; await assert.rejects(d.src.fx());
+  });
+  await test('news: last 7 days from Finnhub, parsed, cached 30 min', async () => {
+    const { src, calls, c } = setup();
+    const r = await src.news('AAPL'); assert.strictEqual(r.value.length, 2);
+    assert.ok(calls[0].url.startsWith('https://finnhub.io/api/v1/company-news?symbol=AAPL&from=2026-09-30&to=2026-10-07&'), calls[0].url);
+    await src.news('AAPL'); assert.strictEqual(calls.length, 1); c.advance(31 * 60e3); await src.news('AAPL'); assert.strictEqual(calls.length, 2);
+  });
+  await test('earnings calendar: one whole-market call for 14 days, trimmed, cached 6 h', async () => {
+    const { src, calls, c, st } = setup();
+    const r = await src.earningsCalendar(); assert.strictEqual(calls.length, 1);
+    assert.ok(/\/calendar\/earnings\?from=2026-10-07&to=2026-10-21&token=/.test(calls[0].url), calls[0].url);
+    assert.deepStrictEqual(Object.keys(r.value[0]).sort(), ['date', 'epsEstimate', 'hour', 'symbol']);
+    c.advance(5 * 3600e3); await src.earningsCalendar(); assert.strictEqual(calls.length, 1);
+    assert.ok(!st.dump().some(([, v]) => v.includes(FH_KEY)), 'key never stored');
+  });
+  await test('focus(view): queued requests for a screen you left are dropped; untagged (alerts/FX) and current ones kept', async () => {
+    const { src, calls, c } = setup();
+    for (let i = 0; i < 55; i++) src.quote('F' + i).catch(() => {}); // fill the minute
+    await new Promise(r => setImmediate(r));
+    const listJobs = ['L1', 'L2', 'L3'].map(s => src.quote(s, { view: 'list' }).then(() => 'ok', e => e.type));
+    const alertJob = src.quote('AL1', { prio: 5 }).then(() => 'ok', e => e.type);
+    const pfJob = src.quote('P1', { view: 'portfolio' }).then(() => 'ok', e => e.type);
+    assert.strictEqual(src.focus('portfolio'), 3);
+    assert.deepStrictEqual(await Promise.all(listJobs), ['cancelled', 'cancelled', 'cancelled']);
+    c.advance(61e3);
+    assert.strictEqual(await pfJob, 'ok'); assert.strictEqual(await alertJob, 'ok');
+    assert.ok(!calls.some(x => /symbol=L\d/.test(x.url)), 'dropped jobs never hit the network');
+    const order = calls.slice(55).map(x => new URL(x.url).searchParams.get('symbol')); assert.deepStrictEqual(order, ['P1', 'AL1'], 'visible screen first');
+  });
+  await test('usage() reports all four providers', async () => {
+    const { src } = setup();
+    await src.quote('AAPL'); await src.candles('AAPL', '1M'); await src.asxQuotes(['BHP', 'CBA']);
+    const u = src.usage();
+    assert.strictEqual(u.fhToday, 1); assert.strictEqual(u.tdToday, 1); assert.deepStrictEqual([u.ms.used, u.ms.cap], [2, 100]); assert.strictEqual(u.frToday, 0); assert.strictEqual(u.pending, 0);
+  });
+  await test('DEMO source: news has no links and is labelled, calendar/ASX/FX are synthetic and labelled', async () => {
+    const d = A.createDemoSource({ names: { AAPL: 'Apple', MSFT: 'Microsoft' } });
+    const n = (await d.news('AAPL')).value; assert.ok(n.length && n.every(x => x.url === null && /^DEMO: /.test(x.headline) && x.demo));
+    assert.ok((await d.fx()).value.demo); assert.ok(/DEMO/.test(d.peekFx().source)); assert.strictEqual(d.peekAsxQuote('BHP').eod, true);
+    assert.ok((await d.asxHistory('BHP')).value.length > 200); assert.strictEqual(d.asxCost(['BHP']), 0); assert.ok(d.asxBudget().demo);
+    const cal = (await d.earningsCalendar()).value; assert.ok(Array.isArray(cal));
   });
   summary('api');
 })();

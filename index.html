@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://finnhub.io https://api.twelvedata.com; manifest-src 'self'; worker-src 'self'; base-uri 'self'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://finnhub.io https://api.twelvedata.com https://api.marketstack.com https://api.frankfurter.dev; manifest-src 'self'; worker-src 'self'; base-uri 'self'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#0b0f14">
 <meta name="color-scheme" content="dark">
@@ -37,7 +37,8 @@
       <p>This watchlist reads market data straight from free data providers. Each provider needs its own free API key, which you paste in once. Keys are kept only in this browser on this phone.</p>
       <ol class="steps">
         <li><b>Finnhub</b> (required): prices, company info, metrics, analyst ratings and earnings dates. Free key at <a href="https://finnhub.io/register" target="_blank" rel="noopener noreferrer">finnhub.io/register</a>.</li>
-        <li><b>Twelve Data</b> (optional): price charts and sparklines. Free key at <a href="https://twelvedata.com/register" target="_blank" rel="noopener noreferrer">twelvedata.com/register</a>.</li>
+        <li><b>Twelve Data</b> (optional): price charts, sparklines and a live USD/AUD rate. Free key at <a href="https://twelvedata.com/register" target="_blank" rel="noopener noreferrer">twelvedata.com/register</a>.</li>
+        <li><b>Marketstack</b> (optional): ASX end-of-day closes in AUD, 100 requests a month. Free key at <a href="https://marketstack.com/signup/free" target="_blank" rel="noopener noreferrer">marketstack.com</a>. You can add it later in Settings.</li>
       </ol>
       <form id="setupForm" class="keys" autocomplete="off">
         <label>Finnhub API key<input name="finnhub" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste key"></label>
@@ -52,6 +53,12 @@
 
   <!-- LIST -->
   <section id="v-list" class="view" hidden>
+    <div class="seg" role="tablist" aria-label="Market">
+      <button type="button" role="tab" data-market="US" id="mkUS">US · USD</button>
+      <button type="button" role="tab" data-market="ASX" id="mkASX">ASX · AUD</button>
+    </div>
+    <div id="overview" class="card overview" aria-label="Market overview"></div>
+    <div id="asxBar" class="card asxbar" hidden></div>
     <div class="toolbar">
       <input id="search" type="search" placeholder="Search ticker or company" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Search">
     </div>
@@ -75,7 +82,7 @@
       <button id="addCancel" class="ghost sm" type="button">Cancel</button>
     </form>
     <div id="addMsg" class="small muted pad"></div>
-    <div class="list-head"><span></span><span>Ticker</span><span class="c">1M</span><span class="r">Price · Day</span></div>
+    <div class="list-head"><span></span><span>Ticker</span><span class="c">1M</span><span class="r" id="pxHead">Price · Day</span></div>
     <ul id="list" class="list"></ul>
     <p id="listEmpty" class="muted pad" hidden>No matches.</p>
     <p id="listNote" class="muted small pad"></p>
@@ -90,17 +97,91 @@
         <div id="dChange"></div>
         <div id="dRangeChange" class="small muted"></div>
       </div>
-      <button id="dFav" class="star big-star" type="button" aria-label="Favourite">☆</button>
+      <div class="d-actions">
+        <button id="dFav" class="star big-star" type="button" aria-label="Favourite">☆</button>
+        <button id="dAlert" class="chip" type="button" aria-label="Add price alert">🔔 Alert</button>
+      </div>
     </div>
+    <div id="dNote" class="note small" hidden></div>
     <div id="chartTip" class="tip small">Touch and drag on the chart to see price and date</div>
     <div class="chart-wrap"><canvas id="chart" aria-label="Price chart"></canvas></div>
     <div id="ranges" class="ranges" role="tablist"></div>
     <div id="chartMsg" class="small muted pad"></div>
 
+    <div class="card"><h2>News <span class="muted small">last 7 days</span></h2><ul id="news" class="news"></ul></div>
     <div class="card"><h2>Analyst ratings</h2><div id="ratings"></div></div>
     <div class="card"><h2>Price targets</h2><div id="targets"></div></div>
     <div class="card"><h2>Key metrics</h2><dl id="metrics" class="metrics"></dl></div>
     <button id="dRemove" class="danger wide" type="button">Remove from watchlist</button>
+  </section>
+
+  <!-- PORTFOLIO -->
+  <section id="v-portfolio" class="view" hidden>
+    <div id="pfPrompt" class="card prompt" hidden></div>
+    <div class="card pf-total">
+      <div class="muted small">Total value (AUD)</div>
+      <div id="pfValue" class="big">—</div>
+      <div class="pf-grid">
+        <div><span class="muted small">Cost</span><b id="pfCost">—</b></div>
+        <div><span class="muted small">Unrealised</span><b id="pfGain">—</b></div>
+        <div><span class="muted small">Today</span><b id="pfDay">—</b></div>
+      </div>
+      <div id="pfFx" class="small muted"></div>
+      <div id="pfNote" class="small muted"></div>
+    </div>
+    <div class="toolbar"><span class="muted small grow">Holdings · tap to edit</span><button id="pfRefresh" class="chip" type="button" aria-label="Refresh portfolio">↻</button><button id="pfAddBtn" class="chip accent" type="button">＋ Holding</button></div>
+    <form id="pfForm" class="card pf-form" hidden autocomplete="off">
+      <h2 id="pfFormTitle">Add holding</h2>
+      <div class="row">
+        <label class="grow">Ticker<input name="symbol" placeholder="e.g. BHP or AAPL" autocapitalize="characters" autocomplete="off" spellcheck="false"></label>
+        <label>Exchange<select name="exchange"><option value="ASX">ASX (AUD)</option><option value="US">US (USD)</option></select></label>
+      </div>
+      <div class="row">
+        <label class="grow">Units<input name="units" type="number" inputmode="decimal" min="0" step="any" placeholder="0"></label>
+        <label class="grow">Average cost <span id="pfCur">A$</span><input name="avgCost" type="number" inputmode="decimal" min="0" step="any" placeholder="per unit"></label>
+      </div>
+      <label>Buy date (optional)<input name="buyDate" type="date"></label>
+      <div class="row"><button class="primary grow" type="submit">Save</button><button id="pfDelete" class="danger" type="button" hidden>Delete</button><button id="pfCancel" class="ghost" type="button">Cancel</button></div>
+      <div id="pfMsg" class="small muted"></div>
+    </form>
+    <ul id="pfList" class="pf-list"></ul>
+    <p class="muted small pad">Holdings are saved only on this device. US holdings are converted to AUD at the current USD/AUD rate, and so is their cost, so the gain shows the share-price move only, not currency moves since you bought. ASX values use the latest end-of-day close.</p>
+  </section>
+
+  <!-- EARNINGS -->
+  <section id="v-earnings" class="view" hidden>
+    <div class="card small" id="earnInfo"></div>
+    <div id="earnList"></div>
+  </section>
+
+  <!-- ALERTS -->
+  <section id="v-alerts" class="view" hidden>
+    <div class="card">
+      <h2>New alert</h2>
+      <form id="alForm" class="al-form" autocomplete="off">
+        <div class="row">
+          <label class="grow">Ticker<input name="sym" placeholder="e.g. AAPL or BHP" autocapitalize="characters" autocomplete="off" spellcheck="false"></label>
+          <label>Market<select name="market"><option value="US">US</option><option value="ASX">ASX</option></select></label>
+        </div>
+        <div class="row">
+          <label class="grow">When<select name="type"><option value="above">Price rises above</option><option value="below">Price falls below</option><option value="movePct">Daily move ≥ ±%</option></select></label>
+          <label class="grow">Value<input name="value" type="number" inputmode="decimal" min="0" step="any" placeholder="e.g. 250"></label>
+        </div>
+        <button class="primary wide" type="submit">Add alert</button>
+        <div id="alMsg" class="small muted"></div>
+      </form>
+    </div>
+    <div class="card"><h2>Active alerts</h2><ul id="alRules" class="al-list"></ul></div>
+    <div class="card">
+      <div class="row"><h2 class="grow">History</h2><button id="alClear" class="ghost sm" type="button">Clear</button></div>
+      <ul id="alHistory" class="al-list"></ul>
+    </div>
+    <div class="card small">
+      <h2>How alerts work</h2>
+      <p id="alHow">Alerts are checked on this device only while the app is open: when it opens and on every refresh. A price alert fires once when the price crosses your level and re-arms after it moves back. A daily-move alert fires at most once per trading day. Background push (alerts while the app is closed) needs a server, which this static app doesn't have, so it isn't supported.</p>
+      <p id="notifState"></p>
+      <button id="notifBtn" class="ghost wide" type="button" hidden>Allow notifications</button>
+    </div>
   </section>
 
   <!-- SETTINGS -->
@@ -110,7 +191,8 @@
       <p class="small muted">Saved only in this browser's localStorage on this device and sent only to the provider it belongs to. They are never written to any file.</p>
       <form id="keysForm" class="keys" autocomplete="off">
         <label>Finnhub API key<input name="finnhub" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Not set"></label>
-        <label>Twelve Data API key (charts, optional)<input name="twelvedata" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Not set"></label>
+        <label>Twelve Data API key (charts, live USD/AUD, optional)<input name="twelvedata" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Not set"></label>
+        <label>Marketstack access key (ASX end-of-day, optional)<input name="marketstack" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Not set"></label>
         <label class="check"><input type="checkbox" id="showKeys"> Show keys</label>
         <div class="row"><button class="primary grow" type="submit">Save keys</button><button id="clearKeys" class="ghost" type="button">Remove keys</button></div>
         <div id="keysMsg" class="small muted"></div>
@@ -122,22 +204,37 @@
       <label>Auto-refresh prices
         <select id="refreshSel"><option value="60">Every minute</option><option value="120">Every 2 minutes</option><option value="300">Every 5 minutes</option><option value="0">Off (tap ↻)</option></select>
       </label>
-      <div id="usage" class="small muted"></div>
+      <label>Marketstack requests allowed per month on this device
+        <input id="msCap" type="number" inputmode="numeric" min="0" max="100000" step="1">
+      </label>
+    </div>
+    <div class="card">
+      <h2>API calls by provider</h2>
+      <div id="usage" class="small"></div>
     </div>
     <div class="card">
       <h2>Watchlist</h2>
       <p class="small muted" id="defaultInfo"></p>
-      <div class="row"><button id="resetList" class="ghost grow" type="button">Reset list to default</button><button id="clearCache" class="ghost grow" type="button">Clear cached data</button></div>
+      <div class="row"><button id="resetList" class="ghost grow" type="button">Reset lists to default</button><button id="clearCache" class="ghost grow" type="button">Clear cached data</button></div>
       <div id="listMsg" class="small muted"></div>
     </div>
     <div class="card small">
       <h2>About the data</h2>
       <p><b>Finnhub free</b> (60 calls/min): quote, company profile, basic financials, recommendation trends, earnings calendar. Price targets and candles are premium, so price targets show <i>n/a (not on free tier)</i>.</p>
-      <p><b>Twelve Data free</b> (8 credits/min, 800/day): price history for the chart and the 1-month sparklines. 1M, 6M and 1Y share one daily series.</p>
-      <p>Responses are cached on this device: quotes 1 min, metrics and ratings 12 h, profiles 7 days, charts 5 min (1D) to 24 h (5Y). Data may be delayed. Not financial advice.</p>
+      <p><b>Twelve Data free</b> (8 credits/min, 800/day): price history for the chart and the 1-month sparklines (1M, 6M and 1Y share one daily series), and the live USD/AUD rate. ASX symbols are not on the free plan.</p>
+      <p><b>Marketstack free</b> (100 requests/month, every symbol counts): the only free source we found that a web page can call for ASX prices. End-of-day closes only, about 1 year of history. Nothing ASX loads on a timer except your portfolio holdings.</p>
+      <p><b>Frankfurter</b> (no key): ECB daily reference USD/AUD rate, used when there's no Twelve Data key.</p>
+      <p><b>Not available free for ASX:</b> live or intraday prices, analyst ratings, price targets, metrics, news and earnings dates. These show <i>n/a</i> with the reason.</p>
+      <p>Responses are cached on this device: quotes 1 min, news 30 min, metrics and ratings 12 h, earnings calendar 6 h, profiles 7 days, charts 5 min (1D) to 24 h (5Y), ASX closes until the next close is out (6 pm Sydney time, trading days), USD/AUD 10 min (live) or 6 h (ECB). Data may be delayed. Not financial advice.</p>
     </div>
   </section>
 </main>
+<nav id="tabs" class="tabs" aria-label="Sections">
+  <button type="button" data-tab="list" id="tabList"><span class="ti">☰</span>Watchlist</button>
+  <button type="button" data-tab="portfolio" id="tabPortfolio"><span class="ti">◔</span>Portfolio</button>
+  <button type="button" data-tab="earnings" id="tabEarnings"><span class="ti">▦</span>Earnings</button>
+  <button type="button" data-tab="alerts" id="tabAlerts"><span class="ti">🔔</span>Alerts<span id="alertBadge" class="tbadge" hidden>0</span></button>
+</nav>
 <footer id="foot">Not financial advice · Delayed data</footer>
 <script src="logic.js"></script>
 <script src="api.js"></script>

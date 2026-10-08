@@ -1,0 +1,33 @@
+{
+  "asOf": "2026-10-08",
+  "description": "The three ETFs from the portfolio seed, then the top 20 ASX-listed companies by market capitalisation (AUD).",
+  "sources": [
+    "ASX companies and market caps: https://www.marketindex.com.au/asx-listed-companies"
+  ],
+  "note": "marketCapAUD is a snapshot taken on asOf, used only to order the list. It is never shown as a live value.",
+  "symbols": [
+    {"symbol": "FANG", "name": "Global X FANG+ ETF", "marketCapAUD": 1821924214, "type": "ETF"},
+    {"symbol": "SEMI", "name": "Global X Semiconductor ETF", "marketCapAUD": 1107498324, "type": "ETF"},
+    {"symbol": "IVV", "name": "iShares S&P 500 ETF", "marketCapAUD": 15220538968, "type": "ETF"},
+    {"symbol": "BHP", "name": "BHP Group", "marketCapAUD": 311914590854},
+    {"symbol": "CBA", "name": "Commonwealth Bank of Australia", "marketCapAUD": 248007121456},
+    {"symbol": "NAB", "name": "National Australia Bank", "marketCapAUD": 117622406757},
+    {"symbol": "WBC", "name": "Westpac Banking Corporation", "marketCapAUD": 115572048676},
+    {"symbol": "ANZ", "name": "ANZ Group Holdings", "marketCapAUD": 112795404148},
+    {"symbol": "MQG", "name": "Macquarie Group", "marketCapAUD": 94676300660},
+    {"symbol": "CSL", "name": "CSL", "marketCapAUD": 86729484840},
+    {"symbol": "WES", "name": "Wesfarmers", "marketCapAUD": 86252926240},
+    {"symbol": "WDS", "name": "Woodside Energy Group", "marketCapAUD": 61272457609},
+    {"symbol": "RIO", "name": "RIO Tinto", "marketCapAUD": 60777895640},
+    {"symbol": "GMG", "name": "Goodman Group", "marketCapAUD": 54081140598},
+    {"symbol": "TLS", "name": "Telstra Group", "marketCapAUD": 53969115117},
+    {"symbol": "FMG", "name": "Fortescue", "marketCapAUD": 48647645704},
+    {"symbol": "WOW", "name": "Woolworths Group", "marketCapAUD": 47294212718},
+    {"symbol": "TCL", "name": "Transurban Group", "marketCapAUD": 40301930100},
+    {"symbol": "QBE", "name": "QBE Insurance Group", "marketCapAUD": 36300484817},
+    {"symbol": "ALL", "name": "Aristocrat Leisure", "marketCapAUD": 35748237165},
+    {"symbol": "NST", "name": "Northern Star Resources", "marketCapAUD": 34280809792},
+    {"symbol": "COL", "name": "Coles Group", "marketCapAUD": 31034167145},
+    {"symbol": "SIG", "name": "Sigma Healthcare", "marketCapAUD": 30186782916}
+  ]
+}

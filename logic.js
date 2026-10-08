@@ -3,11 +3,13 @@
   'use strict';
   const NA_FREE = 'n/a (not on free tier)';
   const NA_NONE = 'n/a (not reported)';
-  const KEYS = { watchlist: 'stockwatch.watchlist.v1', settings: 'stockwatch.settings.v1', apiKeys: 'stockwatch.keys.v1', usage: 'stockwatch.usage.v1' };
+  const KEYS = { watchlist: 'stockwatch.watchlist.v1', watchlistAsx: 'stockwatch.watchlist.asx.v1', settings: 'stockwatch.settings.v1', apiKeys: 'stockwatch.keys.v1',
+    usage: 'stockwatch.usage.v1', usageMonth: 'stockwatch.usage.month.v1', portfolio: 'stockwatch.portfolio.v1', alerts: 'stockwatch.alerts.v1' };
   const CACHE_PREFIX = 'stockwatch.cache.';
   const MIN = 60e3, HOUR = 60 * MIN, DAY = 24 * HOUR;
   const TTL = { quote: MIN, profile: 7 * DAY, metrics: 12 * HOUR, recommendation: 12 * HOUR, earnings: 12 * HOUR, priceTarget: 12 * HOUR, spark: 12 * HOUR,
-    i5: 5 * MIN, i30: 30 * MIN, d1y: 6 * HOUR, w5y: DAY };
+    i5: 5 * MIN, i30: 30 * MIN, d1y: 6 * HOUR, w5y: DAY,
+    news: 30 * MIN, earningsCal: 6 * HOUR, fxLive: 10 * MIN, fxDaily: 6 * HOUR };
 
   // Chart ranges -> which Twelve Data series to fetch (1M, 6M and 1Y share one daily series, so they cost one credit together).
   const DATASETS = {
@@ -25,11 +27,13 @@
   const toNum = v => { if (v === null || v === undefined || v === '') return null; const n = Number(v); return isFinite(n) ? n : null; };
 
   /* ---------- formatting ---------- */
-  function fmtPrice(n) {
+  function fmtPrice(n, cur) {
     if (!isNum(n)) return '—';
     const d = Math.abs(n) < 1 ? 4 : 2;
-    return '$' + n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+    return (n < 0 ? '−' : '') + (cur === 'AUD' ? 'A$' : '$') + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
   }
+  // Money with sign for gains: +A$1,234.50 / −$12.00
+  function fmtSignedMoney(n, cur) { if (!isNum(n)) return '—'; return (n > 0 ? '+' : n < 0 ? '−' : '') + (cur === 'AUD' ? 'A$' : '$') + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
   function fmtChange(n) { if (!isNum(n)) return '—'; return (n > 0 ? '+' : n < 0 ? '−' : '') + Math.abs(n).toFixed(2); }
   function fmtPct(n) { if (!isNum(n)) return '—'; return (n > 0 ? '+' : n < 0 ? '−' : '') + Math.abs(n).toFixed(2) + '%'; }
   function fmtBig(n, prefix = '$') {
@@ -60,6 +64,10 @@
   }
 
   /* ---------- symbols, sorting, search ---------- */
+  function normalizeAsx(s) { const t = String(s || '').trim().toUpperCase().replace(/^ASX:/, '').replace(/\.(AX|XASX)$/, ''); return /^[A-Z0-9]{2,6}$/.test(t) ? t : null; }
+  // Internal ids: US tickers as-is ('AAPL'), ASX as 'ASX:BHP'.
+  const makeId = (symbol, exchange) => exchange === 'ASX' ? 'ASX:' + symbol : symbol;
+  const parseId = id => String(id).startsWith('ASX:') ? { symbol: String(id).slice(4), exchange: 'ASX' } : { symbol: String(id), exchange: 'US' };
   function normalizeSymbol(s) {
     const t = String(s || '').trim().toUpperCase().replace(/\s+/g, '').replace(/^([A-Z]+)[-/]([A-Z])$/, '$1.$2');
     return /^[A-Z][A-Z0-9.]{0,9}$/.test(t) ? t : null;
@@ -95,8 +103,9 @@
     return { version: 1, symbols: (defaults || []).map(d => ({ symbol: d.symbol, name: d.name || '' })), favourites: [],
       sort: { key: 'marketCap', dir: 'desc' }, favouritesFirst: false };
   }
-  function addSymbol(wl, sym, name) {
-    const s = normalizeSymbol(sym); if (!s) throw new Error('Invalid ticker: use letters, digits or a dot, e.g. AAPL or BRK.B');
+  function addSymbol(wl, sym, name, exchange) {
+    const s = exchange === 'ASX' ? normalizeAsx(sym) : normalizeSymbol(sym);
+    if (!s) throw new Error(exchange === 'ASX' ? 'Invalid ASX code: 2 to 6 letters or digits, e.g. BHP or FANG' : 'Invalid ticker: use letters, digits or a dot, e.g. AAPL or BRK.B');
     if (wl.symbols.some(x => x.symbol === s)) return false;
     wl.symbols.push({ symbol: s, name: name || '' }); return true;
   }
@@ -109,18 +118,18 @@
     if (wl.symbols.some(x => x.symbol === sym)) { wl.favourites.push(sym); return true; } return false;
   }
   function setName(wl, sym, name) { const x = wl.symbols.find(s => s.symbol === sym); if (x && name && !x.name) { x.name = name; return true; } return false; }
-  function loadWatchlist(storage, defaults) {
-    let raw = null; try { raw = JSON.parse(storage.getItem(KEYS.watchlist)); } catch (e) { raw = null; }
+  function loadWatchlist(storage, defaults, key = KEYS.watchlist, norm = normalizeSymbol) {
+    let raw = null; try { raw = JSON.parse(storage.getItem(key)); } catch (e) { raw = null; }
     if (!raw || !Array.isArray(raw.symbols)) return defaultWatchlist(defaults);
     const wl = defaultWatchlist([]);
     const seen = new Set();
-    for (const x of raw.symbols) { const s = normalizeSymbol(x && x.symbol); if (s && !seen.has(s)) { seen.add(s); wl.symbols.push({ symbol: s, name: String(x.name || '') }); } }
+    for (const x of raw.symbols) { const s = norm(x && x.symbol); if (s && !seen.has(s)) { seen.add(s); wl.symbols.push({ symbol: s, name: String(x.name || '') }); } }
     wl.favourites = (Array.isArray(raw.favourites) ? raw.favourites : []).filter(s => seen.has(s));
     if (raw.sort && ['symbol', 'changePct', 'price', 'marketCap'].includes(raw.sort.key)) wl.sort = { key: raw.sort.key, dir: raw.sort.dir === 'asc' ? 'asc' : 'desc' };
     wl.favouritesFirst = !!raw.favouritesFirst;
     return wl;
   }
-  function saveWatchlist(storage, wl) { storage.setItem(KEYS.watchlist, JSON.stringify(wl)); }
+  function saveWatchlist(storage, wl, key = KEYS.watchlist) { storage.setItem(key, JSON.stringify(wl)); }
 
   /* ---------- localStorage cache with TTL ---------- */
   function createCache(storage, now = () => Date.now(), prefix = CACHE_PREFIX) {
@@ -265,21 +274,218 @@
     return null;
   }
   // Classify an API failure so the UI can say something useful.
+  const PROVIDER_NAMES = { finnhub: 'Finnhub', twelvedata: 'Twelve Data', marketstack: 'Marketstack', frankfurter: 'Frankfurter' };
   function classifyError(provider, status, body) {
-    const msg = String((body && (body.error || body.message)) || (typeof body === 'string' ? body : '') || '');
-    const code = body && body.code;
+    // Marketstack: {error: {code: 'missing_access_key', message}} or {error: {code: 104, type: 'usage_limit_reached', info}}
+    const err = body && typeof body.error === 'object' && body.error ? body.error : null;
+    const msg = String((err && (err.message || err.info)) || (body && (body.error || body.message)) || (typeof body === 'string' ? body : '') || '');
+    const code = err ? (err.type || err.code) : body && body.code;
+    const name = PROVIDER_NAMES[provider] || provider;
+    if (provider === 'marketstack') {
+      if (code === 'usage_limit_reached' || code === 'daily_usage_limit_reached') return { type: 'rate-limit', monthly: true, message: 'Marketstack free quota used up (100 requests/month). ASX prices stay as last loaded.' };
+      if (status === 429 || code === 'rate_limit_reached' || code === 'fair_use_limit_reached') return { type: 'rate-limit', message: 'Marketstack rate limit (5 requests/second). Try again in a moment.' };
+      if (code === 'invalid_access_key' || code === 'missing_access_key' || status === 401) return { type: 'auth', message: 'Marketstack rejected the access key. Check it in Settings.' };
+      if (code === 'function_access_restricted' || code === 'https_access_restricted' || status === 403) return { type: 'premium', message: NA_FREE };
+      if (code === 'no_valid_symbols_provided' || status === 404 || status === 422) return { type: 'not-found', message: 'Marketstack has no data for that ticker' };
+    }
     if (status === 429 || code === 429 || /limit|credits/i.test(msg) && !/access/i.test(msg)) {
       const daily = /day|daily/i.test(msg);
       return { type: 'rate-limit', daily, message: provider === 'twelvedata'
         ? 'Twelve Data free limit reached (8 credits/min, 800/day)' + (daily ? ' for today.' : '. Waiting for the next minute.')
         : 'Finnhub free limit reached (60 calls/min). Waiting a minute.' };
     }
-    if (status === 401 || code === 401 || /invalid api key|api key|apikey/i.test(msg) && !/access/i.test(msg)) return { type: 'auth', message: (provider === 'twelvedata' ? 'Twelve Data' : 'Finnhub') + ' rejected the API key. Check it in Settings.' };
+    if (status === 401 || code === 401 || /invalid api key|api key|apikey/i.test(msg) && !/access/i.test(msg)) return { type: 'auth', message: name + ' rejected the API key. Check it in Settings.' };
     if (status === 403 || code === 403 || /access|premium|subscription|plan/i.test(msg)) return { type: 'premium', message: NA_FREE };
     if (status === 404 || code === 404 || code === 400) return { type: 'not-found', message: msg || 'Symbol not found' };
     if (status === 0) return { type: 'network', message: 'Network error. Showing cached data if available.' };
     return { type: 'other', message: msg || ('HTTP ' + status) };
   }
+
+
+  /* ---------- portfolio ---------- */
+  const SEED_PORTFOLIO = [{ symbol: 'FANG', exchange: 'ASX' }, { symbol: 'SEMI', exchange: 'ASX' }, { symbol: 'IVV', exchange: 'ASX' }]; // tickers only, no amounts
+  function defaultPortfolio() { return { version: 1, holdings: SEED_PORTFOLIO.map(h => ({ id: makeId(h.symbol, h.exchange), symbol: h.symbol, exchange: h.exchange, units: 0, avgCost: null, buyDate: '' })) }; }
+  function cleanHolding(x, todayIso) {
+    const exchange = x.exchange === 'US' ? 'US' : 'ASX';
+    const symbol = exchange === 'ASX' ? normalizeAsx(x.symbol) : normalizeSymbol(x.symbol);
+    if (!symbol) throw new Error('Invalid ticker');
+    const units = x.units === '' || x.units == null ? 0 : Number(x.units);
+    if (!isFinite(units) || units < 0) throw new Error('Units must be zero or more');
+    const avgCost = x.avgCost === '' || x.avgCost == null ? null : Number(x.avgCost);
+    if (avgCost !== null && (!isFinite(avgCost) || avgCost <= 0)) throw new Error('Average cost must be more than 0, or blank');
+    const buyDate = x.buyDate ? String(x.buyDate) : '';
+    if (buyDate && (!/^\d{4}-\d{2}-\d{2}$/.test(buyDate) || (todayIso && buyDate > todayIso))) throw new Error('Buy date must be a past date (YYYY-MM-DD)');
+    return { id: makeId(symbol, exchange), symbol, exchange, units, avgCost, buyDate };
+  }
+  function loadPortfolio(storage) {
+    let raw = null; try { raw = JSON.parse(storage.getItem(KEYS.portfolio)); } catch (e) { raw = null; }
+    if (!raw || !Array.isArray(raw.holdings)) return defaultPortfolio();
+    const pf = { version: 1, holdings: [] }, seen = new Set();
+    for (const h of raw.holdings) { try { const c = cleanHolding(h); if (!seen.has(c.id)) { seen.add(c.id); pf.holdings.push(c); } } catch (e) { /* drop invalid */ } }
+    return pf;
+  }
+  function savePortfolio(storage, pf) { storage.setItem(KEYS.portfolio, JSON.stringify(pf)); }
+  function addHolding(pf, h, todayIso) {
+    const c = cleanHolding(h, todayIso);
+    if (pf.holdings.some(x => x.id === c.id)) throw new Error(c.symbol + ' is already in the portfolio. Edit it instead.');
+    pf.holdings.push(c); return c;
+  }
+  function updateHolding(pf, id, patch, todayIso) {
+    const i = pf.holdings.findIndex(x => x.id === id); if (i < 0) return null;
+    const c = cleanHolding({ ...pf.holdings[i], ...patch, symbol: pf.holdings[i].symbol, exchange: pf.holdings[i].exchange }, todayIso);
+    pf.holdings[i] = c; return c;
+  }
+  function removeHolding(pf, id) { const n = pf.holdings.length; pf.holdings = pf.holdings.filter(x => x.id !== id); return pf.holdings.length !== n; }
+  // All values in AUD. getQuote(id) -> {price, change} in the listing currency; fx = {rate} AUD per USD (needed only for US holdings).
+  function portfolioSummary(holdings, getQuote, fx) {
+    const rate = fx && isNum(fx.rate) && fx.rate > 0 ? fx.rate : null;
+    const rows = holdings.map(h => {
+      const q = getQuote(h.id), mult = h.exchange === 'US' ? rate : 1, px = q && isNum(q.price) ? q.price : null;
+      const value = px !== null && mult !== null ? h.units * px * mult : null;
+      const cost = h.avgCost !== null && mult !== null ? h.units * h.avgCost * mult : null;
+      const gain = value !== null && cost !== null ? value - cost : null;
+      const day = q && isNum(q.change) && mult !== null ? h.units * q.change * mult : null;
+      return { ...h, currency: h.exchange === 'US' ? 'USD' : 'AUD', price: px, value, cost, gain, gainPct: gain !== null && cost > 0 ? gain / cost * 100 : null,
+        dayChange: day, dayPct: q && isNum(q.changePct) ? q.changePct : null, needsInput: !(h.units > 0) || h.avgCost === null, missingPrice: h.units > 0 && value === null, weight: null };
+    });
+    const valued = rows.filter(r => r.value !== null), complete = valued.filter(r => r.cost !== null);
+    const totalValue = valued.reduce((s, r) => s + r.value, 0);
+    rows.forEach(r => { r.weight = r.value !== null && totalValue > 0 ? r.value / totalValue * 100 : null; });
+    const cCost = complete.reduce((s, r) => s + r.cost, 0), cGain = complete.reduce((s, r) => s + r.gain, 0);
+    const dayRows = valued.filter(r => r.dayChange !== null), dayTotal = dayRows.reduce((s, r) => s + r.dayChange, 0);
+    const prevValue = totalValue - dayTotal;
+    return { rows, currency: 'AUD', needsFx: holdings.some(h => h.exchange === 'US' && h.units > 0), fxMissing: holdings.some(h => h.exchange === 'US' && h.units > 0) && rate === null,
+      total: { value: valued.length ? totalValue : null, cost: complete.length ? cCost : null, gain: complete.length ? cGain : null, gainPct: cCost > 0 ? cGain / cCost * 100 : null,
+        dayChange: dayRows.length ? dayTotal : null, dayPct: dayRows.length && prevValue > 0 ? dayTotal / prevValue * 100 : null },
+      missing: rows.filter(r => r.missingPrice).map(r => r.symbol), needsInput: rows.filter(r => r.needsInput).map(r => r.symbol) };
+  }
+
+  /* ---------- alerts ---------- */
+  const ALERT_TYPES = { above: 'Price above', below: 'Price below', movePct: 'Daily move ≥ %' };
+  function emptyAlerts() { return { version: 1, rules: [], history: [] }; }
+  function loadAlerts(storage) {
+    let raw = null; try { raw = JSON.parse(storage.getItem(KEYS.alerts)); } catch (e) { raw = null; }
+    if (!raw || !Array.isArray(raw.rules)) return emptyAlerts();
+    return { version: 1, rules: raw.rules.filter(r => r && r.id && ALERT_TYPES[r.type] && isNum(r.value)), history: Array.isArray(raw.history) ? raw.history.slice(0, 200) : [] };
+  }
+  function saveAlerts(storage, st) { storage.setItem(KEYS.alerts, JSON.stringify(st)); }
+  function addAlertRule(st, { sym, type, value }) {
+    const id = parseId(sym), symbol = id.exchange === 'ASX' ? normalizeAsx(id.symbol) : normalizeSymbol(id.symbol);
+    if (!symbol) throw new Error('Invalid ticker');
+    if (!ALERT_TYPES[type]) throw new Error('Pick an alert type');
+    const v = Number(value);
+    if (!isFinite(v) || v <= 0 || (type === 'movePct' && v > 100)) throw new Error(type === 'movePct' ? 'Move must be between 0 and 100 %' : 'Price must be more than 0');
+    const rule = { id: 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), sym: makeId(symbol, id.exchange), type, value: v, enabled: true, armed: true, lastDay: '' };
+    st.rules.push(rule); return rule;
+  }
+  function removeAlertRule(st, ruleId) { const n = st.rules.length; st.rules = st.rules.filter(r => r.id !== ruleId); return st.rules.length !== n; }
+  // Price alerts fire once when crossed and re-arm after the price moves back. Move alerts fire at most once per trading day.
+  function evaluateAlerts(st, quotes, now, opts = {}) {
+    const fired = [];
+    for (const r of st.rules) {
+      const q = quotes[r.sym]; if (!r.enabled || !q || !isNum(q.price)) continue;
+      let hit = false;
+      if (r.type === 'above' || r.type === 'below') {
+        const cond = r.type === 'above' ? q.price >= r.value : q.price <= r.value;
+        if (cond && r.armed !== false) { hit = true; r.armed = false; } else if (!cond) r.armed = true;
+      } else if (r.type === 'movePct' && isNum(q.changePct)) {
+        const day = q.date || (isNum(q.t) ? isoDate(new Date(q.t)) : isoDate(new Date(now)));
+        if (Math.abs(q.changePct) >= r.value && r.lastDay !== day) { hit = true; r.lastDay = day; }
+      }
+      if (hit) {
+        const e = { id: 'h' + now.toString(36) + Math.random().toString(36).slice(2, 6), ruleId: r.id, sym: r.sym, type: r.type, value: r.value, price: q.price, changePct: isNum(q.changePct) ? q.changePct : null, t: now, seen: false, demo: !!opts.demo, eod: !!q.eod };
+        st.history.unshift(e); fired.push(e);
+      }
+    }
+    st.history = st.history.slice(0, 200);
+    return fired;
+  }
+  function alertMessage(e) {
+    const { symbol, exchange } = parseId(e.sym), cur = exchange === 'ASX' ? 'AUD' : 'USD';
+    const base = e.type === 'above' ? `${symbol} is above ${fmtPrice(e.value, cur)} (now ${fmtPrice(e.price, cur)})`
+      : e.type === 'below' ? `${symbol} is below ${fmtPrice(e.value, cur)} (now ${fmtPrice(e.price, cur)})`
+      : `${symbol} moved ${fmtPct(e.changePct)} today (alert at ±${e.value}%)`;
+    return (e.demo ? 'DEMO: ' : '') + base + (e.eod ? ' · end-of-day price' : '');
+  }
+  const unseenAlerts = st => st.history.filter(h => !h.seen).length;
+
+  /* ---------- overview, earnings, news ---------- */
+  function topMovers(rows, n = 5) {
+    const ok = rows.filter(r => isNum(r.changePct));
+    return { gainers: ok.filter(r => r.changePct > 0).sort((a, b) => b.changePct - a.changePct).slice(0, n),
+      losers: ok.filter(r => r.changePct < 0).sort((a, b) => a.changePct - b.changePct).slice(0, n) };
+  }
+  function parseEarningsCalendar(j) {
+    return ((j && j.earningsCalendar) || []).filter(e => e && e.symbol && e.date)
+      .map(e => ({ symbol: e.symbol, date: e.date, hour: e.hour || '', epsEstimate: toNum(e.epsEstimate), revenueEstimate: toNum(e.revenueEstimate) }));
+  }
+  const HOUR_ORDER = { bmo: 0, dmh: 1, amc: 2, '': 3 };
+  const HOUR_LABEL = { bmo: 'Before market open', amc: 'After market close', dmh: 'During market hours', '': 'Time not announced' };
+  function upcomingEarnings(list, symbols, fromIso, toIso) {
+    const want = symbols instanceof Set ? symbols : new Set(symbols);
+    const seen = new Set();
+    return list.filter(e => want.has(e.symbol) && e.date >= fromIso && e.date <= toIso)
+      .filter(e => { const k = e.symbol + e.date; if (seen.has(k)) return false; seen.add(k); return true; })
+      .sort((a, b) => a.date.localeCompare(b.date) || (HOUR_ORDER[a.hour] ?? 3) - (HOUR_ORDER[b.hour] ?? 3) || a.symbol.localeCompare(b.symbol));
+  }
+  function groupByDate(list) { const out = []; for (const e of list) { let g = out[out.length - 1]; if (!g || g.date !== e.date) out.push(g = { date: e.date, items: [] }); g.items.push(e); } return out; }
+  const safeUrl = u => (typeof u === 'string' && /^https?:\/\/[^\s"'<>]+$/i.test(u) ? u : null);
+  function parseNews(arr, limit = 15) {
+    const seen = new Set();
+    return (Array.isArray(arr) ? arr : []).filter(n => n && n.headline && safeUrl(n.url) && isNum(n.datetime))
+      .sort((a, b) => b.datetime - a.datetime)
+      .filter(n => { const k = n.url + '|' + n.headline; if (seen.has(k)) return false; seen.add(k); return true; })
+      .slice(0, limit).map(n => ({ headline: String(n.headline).slice(0, 300), source: String(n.source || ''), t: n.datetime * 1000, url: safeUrl(n.url) }));
+  }
+  function fmtAgo(ms, now = Date.now()) {
+    const s = Math.max(0, (now - ms) / 1000);
+    if (s < 3600) return Math.max(1, Math.round(s / 60)) + ' min ago';
+    if (s < 86400) return Math.round(s / 3600) + ' h ago';
+    return Math.round(s / 86400) + ' d ago';
+  }
+
+  /* ---------- ASX end-of-day (Marketstack) + FX ---------- */
+  // Response: {data: [{symbol: 'BHP.AX', exchange: 'XASX', date: '2026-10-07T00:00:00+0000', close, volume}, ...]} newest first.
+  function parseMarketstackEod(j) {
+    const out = {};
+    for (const r of (j && j.data) || []) {
+      if (!r || !r.symbol || !isNum(toNum(r.close))) continue;
+      const sym = String(r.symbol).replace(/\.(AX|XASX)$/i, '').toUpperCase();
+      (out[sym] = out[sym] || []).push({ d: String(r.date).slice(0, 10), c: toNum(r.close), v: toNum(r.volume) });
+    }
+    for (const k in out) { const seen = new Set(); out[k] = out[k].filter(b => !seen.has(b.d) && seen.add(b.d)).sort((a, b) => a.d.localeCompare(b.d)); }
+    return out;
+  }
+  function eodQuote(bars) {
+    if (!bars || !bars.length) return null;
+    const last = bars[bars.length - 1], prev = bars.length > 1 ? bars[bars.length - 2] : null;
+    return { price: last.c, prevClose: prev ? prev.c : null, change: prev ? last.c - prev.c : null, changePct: prev && prev.c ? (last.c - prev.c) / prev.c * 100 : null,
+      date: last.d, t: Date.parse(last.d + 'T00:00:00Z'), volume: last.v, eod: true };
+  }
+  function parseTwelveRate(j) { const r = toNum(j && j.rate); return r && r > 0 ? { rate: r, t: toNum(j.timestamp) ? j.timestamp * 1000 : null } : null; }
+  function parseFrankfurter(j) { const r = toNum(j && j.rates && j.rates.AUD); return r && r > 0 ? { rate: r, date: j.date || '' } : null; }
+  const monthKey = ms => new Date(ms).toISOString().slice(0, 7);
+  // ASX closes at 4 pm Sydney time; end-of-day data is assumed ready by 6 pm. A cached close stays fresh until the next such time
+  // (skipping weekends), so each ASX ticker costs at most one Marketstack request per trading day.
+  function asxTtl(ms) {
+    let wall;
+    try {
+      const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: 'Australia/Sydney', hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+        .formatToParts(new Date(ms)).map(x => [x.type, x.value]));
+      wall = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second);
+    } catch (e) { wall = ms + 10 * HOUR; }
+    const off = wall - ms, t = new Date(wall);
+    let target = Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate(), 18);
+    if (wall >= target) target += DAY;
+    while ([0, 6].includes(new Date(target).getUTCDay())) target += DAY;
+    return Math.min(4 * DAY, Math.max(HOUR, target - off - ms));
+  }
+  // Calendar date in New York (US earnings dates are exchange-local), plus or minus whole days.
+  function usDate(ms, addDays = 0) {
+    const t = ms + addDays * DAY;
+    try { return new Date(t).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }).slice(0, 10); } catch (e) { return new Date(t - 4 * HOUR).toISOString().slice(0, 10); }
+  }
+
   // Display helper: undefined = provider never sends the field (free tier), null = sent but empty.
   function show(v, fmt) { if (v === undefined) return NA_FREE; if (v === null || (typeof v === 'number' && !isFinite(v))) return NA_NONE; return fmt(v); }
 
@@ -287,6 +493,10 @@
     fmtPrice, fmtChange, fmtPct, fmtBig, fmtVolume, fmtRatio, fmtPercentValue, fmtBarTime, fmtAsOf, direction, isoDate, isNum, toNum,
     normalizeSymbol, sortRows, searchRows, defaultWatchlist, addSymbol, removeSymbol, toggleFavourite, setName, loadWatchlist, saveWatchlist,
     createCache, waitTime, parseFinnhubQuote, parseFinnhubProfile, parseFinnhubMetrics, latestRecommendation, consensus, nextEarnings,
-    parseFinnhubPriceTarget, parseTwelveSeries, sliceRange, rangeChange, sessionVolume, sparkPath, marketCap, classifyError, show };
+    parseFinnhubPriceTarget, parseTwelveSeries, sliceRange, rangeChange, sessionVolume, sparkPath, marketCap, classifyError, show,
+    fmtSignedMoney, normalizeAsx, makeId, parseId, SEED_PORTFOLIO, defaultPortfolio, loadPortfolio, savePortfolio, addHolding, updateHolding, removeHolding, portfolioSummary,
+    ALERT_TYPES, emptyAlerts, loadAlerts, saveAlerts, addAlertRule, removeAlertRule, evaluateAlerts, alertMessage, unseenAlerts,
+    topMovers, parseEarningsCalendar, upcomingEarnings, groupByDate, HOUR_LABEL, safeUrl, parseNews, fmtAgo,
+    parseMarketstackEod, eodQuote, parseTwelveRate, parseFrankfurter, monthKey, usDate, asxTtl };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.SWL = api;
 })(typeof self !== 'undefined' ? self : this);

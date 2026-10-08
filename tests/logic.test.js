@@ -1,6 +1,7 @@
 // Run: node tests/logic.test.js
 const assert = require('assert');
 const L = require('../logic.js');
+const mocks = require('./mocks.js');
 const { memStorage, clock, test, summary } = require('./helpers.js');
 const defaults = require('../data/default-watchlist.json');
 
@@ -195,6 +196,136 @@ const defaults = require('../data/default-watchlist.json');
     assert.strictEqual(L.classifyError('finnhub', 403, { error: "You don't have access to this resource." }).message, 'n/a (not on free tier)');
     assert.strictEqual(L.classifyError('twelvedata', 200, { code: 400, message: '**symbol** not found: ZZZZ' }).type, 'not-found');
     assert.strictEqual(L.classifyError('finnhub', 0, null).type, 'network');
+  });
+  /* ---------- turn 2: ASX ids, portfolio, alerts, overview, earnings, news, Marketstack, FX ---------- */
+  await test('ASX codes and ids', () => {
+    assert.strictEqual(L.normalizeAsx(' bhp '), 'BHP'); assert.strictEqual(L.normalizeAsx('fang.ax'), 'FANG'); assert.strictEqual(L.normalizeAsx('ASX:IVV'), 'IVV');
+    assert.strictEqual(L.normalizeAsx('A'), null); assert.strictEqual(L.normalizeAsx('BRK.B'), null); assert.strictEqual(L.normalizeAsx('TOOLONG7'), null);
+    assert.strictEqual(L.makeId('BHP', 'ASX'), 'ASX:BHP'); assert.strictEqual(L.makeId('AAPL', 'US'), 'AAPL');
+    assert.deepStrictEqual(L.parseId('ASX:BHP'), { symbol: 'BHP', exchange: 'ASX' }); assert.deepStrictEqual(L.parseId('BRK.B'), { symbol: 'BRK.B', exchange: 'US' });
+    const w = L.defaultWatchlist([]); assert.strictEqual(L.addSymbol(w, 'wtc', '', 'ASX'), true); assert.strictEqual(w.symbols[0].symbol, 'WTC');
+    assert.throws(() => L.addSymbol(w, 'BRK.B', '', 'ASX'), /ASX code/);
+    const st = memStorage(); L.saveWatchlist(st, { symbols: [{ symbol: 'bhp' }, { symbol: 'x' }], favourites: ['BHP'] }, L.KEYS.watchlistAsx);
+    const back = L.loadWatchlist(st, [], L.KEYS.watchlistAsx, L.normalizeAsx); assert.deepStrictEqual(back.symbols.map(s => s.symbol), ['BHP']); assert.deepStrictEqual(back.favourites, ['BHP']);
+    assert.strictEqual(L.fmtPrice(12.5, 'AUD'), 'A$12.50'); assert.strictEqual(L.fmtPrice(-3, 'USD'), '−$3.00'); assert.strictEqual(L.fmtSignedMoney(1234.5, 'AUD'), '+A$1,234.50'); assert.strictEqual(L.fmtSignedMoney(-2, 'USD'), '−$2.00');
+  });
+  await test('portfolio seed is tickers only: FANG, SEMI, IVV on ASX with units 0 and blank cost', () => {
+    const pf = L.defaultPortfolio();
+    assert.deepStrictEqual(pf.holdings.map(h => h.id), ['ASX:FANG', 'ASX:SEMI', 'ASX:IVV']);
+    for (const h of pf.holdings) { assert.strictEqual(h.units, 0); assert.strictEqual(h.avgCost, null); assert.strictEqual(h.buyDate, ''); }
+    assert.deepStrictEqual(L.SEED_PORTFOLIO.map(h => Object.keys(h).sort()), [['exchange', 'symbol'], ['exchange', 'symbol'], ['exchange', 'symbol']], 'seed carries no amounts');
+    const st = memStorage(); assert.deepStrictEqual(L.loadPortfolio(st), pf, 'empty storage -> seed');
+    const sum = L.portfolioSummary(pf.holdings, () => ({ price: 10, change: 1, changePct: 10 }), null);
+    assert.deepStrictEqual(sum.needsInput, ['FANG', 'SEMI', 'IVV']); assert.strictEqual(sum.total.value, 0); assert.strictEqual(sum.total.cost, null);
+  });
+  await test('portfolio add/update/remove validation and storage round-trip', () => {
+    const pf = L.defaultPortfolio(), st = memStorage();
+    L.updateHolding(pf, 'ASX:FANG', { units: '10', avgCost: '20', buyDate: '2026-01-02' }, '2026-10-08');
+    assert.deepStrictEqual(pf.holdings[0], { id: 'ASX:FANG', symbol: 'FANG', exchange: 'ASX', units: 10, avgCost: 20, buyDate: '2026-01-02' });
+    assert.throws(() => L.updateHolding(pf, 'ASX:FANG', { units: -1 }), /Units/); assert.throws(() => L.updateHolding(pf, 'ASX:FANG', { avgCost: 0 }), /cost/);
+    assert.throws(() => L.updateHolding(pf, 'ASX:FANG', { buyDate: '2099-01-01' }, '2026-10-08'), /past date/);
+    L.updateHolding(pf, 'ASX:FANG', { avgCost: '' }); assert.strictEqual(pf.holdings[0].avgCost, null, 'blank cost allowed');
+    L.addHolding(pf, { symbol: 'aapl', exchange: 'US', units: 2, avgCost: 150 });
+    assert.throws(() => L.addHolding(pf, { symbol: 'AAPL', exchange: 'US' }), /already/); assert.throws(() => L.addHolding(pf, { symbol: '??', exchange: 'US' }), /Invalid/);
+    L.savePortfolio(st, pf); assert.deepStrictEqual(L.loadPortfolio(st), pf);
+    assert.strictEqual(L.removeHolding(pf, 'AAPL'), true); assert.strictEqual(L.removeHolding(pf, 'AAPL'), false);
+    st.setItem(L.KEYS.portfolio, JSON.stringify({ holdings: [{ symbol: 'BHP', exchange: 'ASX', units: 'x' }, { symbol: 'CBA', exchange: 'ASX', units: 1, avgCost: null }] }));
+    assert.deepStrictEqual(L.loadPortfolio(st).holdings.map(h => h.id), ['ASX:CBA'], 'invalid rows dropped');
+  });
+  await test('portfolioSummary: AUD values, USD converted at the FX rate, gains, day change, weights', () => {
+    const holdings = [
+      { id: 'ASX:FANG', symbol: 'FANG', exchange: 'ASX', units: 10, avgCost: 20, buyDate: '' },
+      { id: 'AAPL', symbol: 'AAPL', exchange: 'US', units: 2, avgCost: 100, buyDate: '' },
+      { id: 'ASX:SEMI', symbol: 'SEMI', exchange: 'ASX', units: 0, avgCost: null, buyDate: '' }
+    ];
+    const q = { 'ASX:FANG': { price: 30, change: 1, changePct: 3.45 }, AAPL: { price: 150, change: -5, changePct: -3.2 }, 'ASX:SEMI': { price: 9, change: 0, changePct: 0 } };
+    const s = L.portfolioSummary(holdings, id => q[id], { rate: 1.5 });
+    const [fang, aapl, semi] = s.rows;
+    assert.strictEqual(fang.value, 300); assert.strictEqual(fang.cost, 200); assert.strictEqual(fang.gain, 100); assert.strictEqual(fang.gainPct, 50); assert.strictEqual(fang.dayChange, 10);
+    assert.strictEqual(aapl.value, 450); assert.strictEqual(aapl.cost, 300); assert.strictEqual(aapl.gain, 150); assert.strictEqual(aapl.dayChange, -15); assert.strictEqual(aapl.currency, 'USD');
+    assert.strictEqual(semi.value, 0); assert.strictEqual(semi.needsInput, true);
+    assert.strictEqual(s.total.value, 750); assert.strictEqual(s.total.cost, 500); assert.strictEqual(s.total.gain, 250); assert.strictEqual(s.total.gainPct, 50);
+    assert.strictEqual(s.total.dayChange, -5); assert.ok(Math.abs(s.total.dayPct - (-5 / 755 * 100)) < 1e-9);
+    assert.strictEqual(fang.weight, 40); assert.strictEqual(aapl.weight, 60); assert.strictEqual(semi.weight, 0);
+    const noFx = L.portfolioSummary(holdings, id => q[id], null);
+    assert.strictEqual(noFx.fxMissing, true); assert.strictEqual(noFx.rows[1].value, null); assert.deepStrictEqual(noFx.missing, ['AAPL']); assert.strictEqual(noFx.total.value, 300, 'partial total, never guessed');
+    const noPrice = L.portfolioSummary(holdings, id => (id === 'AAPL' ? q[id] : null), { rate: 1.5 });
+    assert.deepStrictEqual(noPrice.missing, ['FANG']); assert.strictEqual(noPrice.rows[0].weight, null); assert.strictEqual(noPrice.rows[1].weight, 100);
+  });
+  await test('alerts: above/below fire once and re-arm, daily move once per day, history capped', () => {
+    const st = L.emptyAlerts();
+    const up = L.addAlertRule(st, { sym: 'AAPL', type: 'above', value: '200' }), dn = L.addAlertRule(st, { sym: 'ASX:BHP', type: 'below', value: 40 }), mv = L.addAlertRule(st, { sym: 'MSFT', type: 'movePct', value: 3 });
+    assert.throws(() => L.addAlertRule(st, { sym: 'AAPL', type: 'above', value: 0 }), /more than 0/); assert.throws(() => L.addAlertRule(st, { sym: 'AAPL', type: 'nope', value: 1 }), /type/);
+    assert.throws(() => L.addAlertRule(st, { sym: 'MSFT', type: 'movePct', value: 101 }), /between/);
+    let f = L.evaluateAlerts(st, { AAPL: { price: 199 }, 'ASX:BHP': { price: 41 }, MSFT: { price: 1, changePct: 1, t: Date.UTC(2026, 9, 7) } }, 1000);
+    assert.strictEqual(f.length, 0);
+    f = L.evaluateAlerts(st, { AAPL: { price: 201 }, 'ASX:BHP': { price: 39.5, eod: true }, MSFT: { price: 1, changePct: -3.4, t: Date.UTC(2026, 9, 7, 15) } }, 2000);
+    assert.deepStrictEqual(f.map(e => e.ruleId).sort(), [up.id, dn.id, mv.id].sort());
+    assert.ok(/AAPL is above \$200\.00 \(now \$201\.00\)/.test(L.alertMessage(f.find(e => e.ruleId === up.id))));
+    assert.ok(/BHP is below A\$40\.00.*end-of-day/.test(L.alertMessage(f.find(e => e.ruleId === dn.id))));
+    assert.ok(/MSFT moved −3\.40% today/.test(L.alertMessage(f.find(e => e.ruleId === mv.id))));
+    f = L.evaluateAlerts(st, { AAPL: { price: 205 }, 'ASX:BHP': { price: 39 }, MSFT: { price: 1, changePct: -5, t: Date.UTC(2026, 9, 7, 16) } }, 3000);
+    assert.strictEqual(f.length, 0, 'no repeats while still past the level / same day');
+    L.evaluateAlerts(st, { AAPL: { price: 190 } }, 4000); f = L.evaluateAlerts(st, { AAPL: { price: 210 } }, 5000);
+    assert.strictEqual(f.length, 1, 're-armed after moving back');
+    f = L.evaluateAlerts(st, { MSFT: { price: 1, changePct: 4, t: Date.UTC(2026, 9, 9, 15) } }, 6000); assert.strictEqual(f.length, 1, 'next day fires again');
+    assert.strictEqual(L.unseenAlerts(st), 5); st.history.forEach(h => { h.seen = true; }); assert.strictEqual(L.unseenAlerts(st), 0);
+    st.rules[0].enabled = false; assert.strictEqual(L.evaluateAlerts(st, { AAPL: { price: 1 } }, 7000).length, 0, 'disabled rule ignored');
+    assert.strictEqual(L.evaluateAlerts(st, { AAPL: { price: null } }, 8000).length, 0, 'no price, no alert');
+    const demo = L.evaluateAlerts(L.loadAlerts(memStorage()), {}, 1); assert.deepStrictEqual(demo, []);
+    const s2 = L.emptyAlerts(); L.addAlertRule(s2, { sym: 'X', type: 'below', value: 5 });
+    for (let i = 0; i < 260; i++) { L.evaluateAlerts(s2, { X: { price: 4 } }, i * 2); L.evaluateAlerts(s2, { X: { price: 6 } }, i * 2 + 1); }
+    assert.strictEqual(s2.history.length, 200, 'history capped at 200');
+    const ms = memStorage(); L.saveAlerts(ms, st); assert.deepStrictEqual(L.loadAlerts(ms).rules.length, 3); assert.strictEqual(L.removeAlertRule(st, mv.id), true);
+    assert.ok(/^DEMO: /.test(L.alertMessage({ sym: 'AAPL', type: 'above', value: 1, price: 2, demo: true })));
+  });
+  await test('topMovers: five each way, ignores missing changes', () => {
+    const rows = [3, -1, 7, null, -8, 2, 0, 5, -4, 9, -2, -6, 1].map((c, i) => ({ symbol: 'S' + i, changePct: c }));
+    const m = L.topMovers(rows, 5);
+    assert.deepStrictEqual(m.gainers.map(r => r.changePct), [9, 7, 5, 3, 2]); assert.deepStrictEqual(m.losers.map(r => r.changePct), [-8, -6, -4, -2, -1]);
+    assert.deepStrictEqual(L.topMovers([{ changePct: null }]), { gainers: [], losers: [] });
+  });
+  await test('earnings calendar: parse, filter to my tickers and 14 days, dedupe, order, group', () => {
+    const list = L.parseEarningsCalendar(mocks.calendar('2026-10-07'));
+    const up = L.upcomingEarnings(list, new Set(['AAPL', 'MSFT', 'NVDA']), '2026-10-07', '2026-10-21');
+    assert.deepStrictEqual(up.map(e => e.symbol + ' ' + e.date), ['AAPL 2026-10-09', 'MSFT 2026-10-12']);
+    assert.strictEqual(up[0].epsEstimate, 1.85); assert.strictEqual(up[1].epsEstimate, null);
+    assert.strictEqual(L.HOUR_LABEL.bmo, 'Before market open'); assert.strictEqual(L.HOUR_LABEL.amc, 'After market close');
+    const g = L.groupByDate([{ date: 'a' }, { date: 'a' }, { date: 'b' }]); assert.deepStrictEqual(g.map(x => [x.date, x.items.length]), [['a', 2], ['b', 1]]);
+    const same = L.upcomingEarnings([{ symbol: 'B', date: 'd', hour: 'amc' }, { symbol: 'A', date: 'd', hour: 'amc' }, { symbol: 'C', date: 'd', hour: 'bmo' }], ['A', 'B', 'C'], 'a', 'z');
+    assert.deepStrictEqual(same.map(e => e.symbol), ['C', 'A', 'B'], 'before-open first, then by ticker');
+    assert.strictEqual(L.usDate(Date.UTC(2026, 9, 8, 2)), '2026-10-07', 'New York date'); assert.strictEqual(L.usDate(Date.UTC(2026, 9, 8, 2), 14), '2026-10-21');
+  });
+  await test('news: newest first, deduped, unsafe links dropped, capped', () => {
+    const n = L.parseNews(mocks.news('AAPL', Date.UTC(2026, 9, 7, 15)));
+    assert.deepStrictEqual(n.map(x => x.headline), ['AAPL mock headline one', 'AAPL mock headline two']);
+    assert.strictEqual(n[0].url, 'https://example.com/news/1'); assert.strictEqual(n[0].t, Date.UTC(2026, 9, 7, 14));
+    assert.deepStrictEqual(L.parseNews(null), []); assert.strictEqual(L.parseNews(Array.from({ length: 40 }, (_, i) => ({ headline: 'h' + i, url: 'https://e.com/' + i, datetime: i }))).length, 15);
+    assert.strictEqual(L.safeUrl('javascript:alert(1)'), null); assert.strictEqual(L.safeUrl('https://a.b/"x'), null);
+    assert.strictEqual(L.fmtAgo(1000, 1000 + 5 * 60e3), '5 min ago'); assert.strictEqual(L.fmtAgo(0, 3 * 3600e3), '3 h ago'); assert.strictEqual(L.fmtAgo(0, 2 * 864e5), '2 d ago');
+  });
+  await test('Marketstack EOD parse + end-of-day quote; FX parsers', () => {
+    const j = { data: [{ symbol: 'BHP.AX', date: '2026-10-07T00:00:00+0000', close: 41, volume: 10 }, { symbol: 'BHP.AX', date: '2026-10-06T00:00:00+0000', close: 40, volume: 9 },
+      { symbol: 'CBA.AX', date: '2026-10-07T00:00:00+0000', close: '170.5' }, { symbol: 'BHP.AX', date: '2026-10-07T00:00:00+0000', close: 41 }, { symbol: 'X.AX', close: null }] };
+    const p = L.parseMarketstackEod(j);
+    assert.deepStrictEqual(Object.keys(p).sort(), ['BHP', 'CBA']); assert.deepStrictEqual(p.BHP.map(b => b.d), ['2026-10-06', '2026-10-07'], 'oldest first, deduped');
+    const q = L.eodQuote(p.BHP); assert.strictEqual(q.price, 41); assert.strictEqual(q.change, 1); assert.strictEqual(q.changePct, 2.5); assert.strictEqual(q.date, '2026-10-07'); assert.strictEqual(q.eod, true);
+    const one = L.eodQuote(p.CBA); assert.strictEqual(one.price, 170.5); assert.strictEqual(one.change, null, 'no previous close -> no change, not zero');
+    assert.strictEqual(L.eodQuote([]), null);
+    assert.deepStrictEqual(L.parseTwelveRate({ symbol: 'USD/AUD', rate: 1.5, timestamp: 100 }), { rate: 1.5, t: 100000 }); assert.strictEqual(L.parseTwelveRate({ status: 'error' }), null);
+    assert.deepStrictEqual(L.parseFrankfurter({ date: '2026-10-07', rates: { AUD: 1.4386 } }), { rate: 1.4386, date: '2026-10-07' }); assert.strictEqual(L.parseFrankfurter({}), null);
+    assert.strictEqual(L.monthKey(Date.UTC(2026, 9, 31, 23)), '2026-10');
+    const H = 36e5; // ASX closes stay cached until 6 pm Sydney on the next trading day
+    assert.strictEqual(L.asxTtl(Date.UTC(2026, 9, 7, 15)) / H, 16, 'Thu 2 am -> Thu 6 pm'); assert.strictEqual(L.asxTtl(Date.UTC(2026, 9, 8, 7, 30)) / H, 23.5, 'Thu 6:30 pm -> Fri 6 pm');
+    assert.strictEqual(L.asxTtl(Date.UTC(2026, 9, 9, 8)) / H, 71, 'Fri 7 pm -> Mon 6 pm (weekend skipped)');
+  });
+  await test('classifyError: Marketstack codes', () => {
+    assert.strictEqual(L.classifyError('marketstack', 429, { error: { code: 104, type: 'usage_limit_reached', info: 'Your monthly usage limit has been reached.' } }).monthly, true);
+    assert.strictEqual(L.classifyError('marketstack', 429, { error: { code: 'rate_limit_reached', message: 'slow down' } }).type, 'rate-limit');
+    assert.strictEqual(L.classifyError('marketstack', 401, { error: { code: 'missing_access_key', message: 'You have not supplied an API Access Key.' } }).type, 'auth');
+    assert.strictEqual(L.classifyError('marketstack', 401, { error: { code: 101, type: 'invalid_access_key', info: 'bad' } }).type, 'auth');
+    assert.strictEqual(L.classifyError('marketstack', 403, { error: { code: 105, type: 'function_access_restricted', info: 'Access Restricted' } }).type, 'premium');
+    assert.strictEqual(L.classifyError('marketstack', 422, { error: { code: 'no_valid_symbols_provided', message: 'x' } }).type, 'not-found');
   });
   summary('logic');
 })();
