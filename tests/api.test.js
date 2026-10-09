@@ -8,17 +8,18 @@ const FH_KEY = 'FAKE_FINNHUB_KEY_FOR_TESTS', TD_KEY = 'FAKE_TWELVE_KEY_FOR_TESTS
 
 function setup(o = {}) {
   const st = memStorage(), c = clock(), calls = [], events = [];
-  const state = { finnhubLimit: false, twelveLimit: false, marketstackLimit: false, frankfurterDown: false, fail: false };
+  const state = { finnhubLimit: false, twelveLimit: false, marketstackLimit: false, frankfurterDown: false, fail: false, sheetCodes: null, sheetBlank: null, sheetStatus: 200 };
   const fetch = async (url, init) => {
     calls.push({ url, t: c.now(), auth: init && init.headers && init.headers.Authorization });
     if (state.fail) throw new TypeError('Failed to fetch');
     const r = mocks.respond(url, { ...state, now: c.now(), authorization: init && init.headers && init.headers.Authorization });
-    return { ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => r.body };
+    return { ok: r.status >= 200 && r.status < 300, status: r.status, json: async () => (r.text !== undefined ? JSON.parse(r.text) : r.body), text: async () => (r.text !== undefined ? r.text : JSON.stringify(r.body)) };
   };
   const keys = { finnhub: FH_KEY, twelvedata: TD_KEY, marketstack: MS_KEY, ...(o.keys || {}) };
   const cap = { v: o.cap ?? 100 };
-  const src = A.createDataSource({ storage: st, fetch, now: c.now, sleep: c.sleep, getKeys: () => keys, onEvent: (t, i) => events.push({ t, ...i }), marketstackCap: () => cap.v });
-  return { st, c, calls, events, state, src, keys, cap, fetch };
+  const sheet = { url: o.sheet || '' };
+  const src = A.createDataSource({ storage: st, fetch, now: c.now, sleep: c.sleep, getKeys: () => keys, onEvent: (t, i) => events.push({ t, ...i }), marketstackCap: () => cap.v, getSheetUrl: () => sheet.url });
+  return { st, c, calls, events, state, src, keys, cap, fetch, sheet };
 }
 
 (async () => {
@@ -225,6 +226,66 @@ function setup(o = {}) {
     assert.strictEqual(await pfJob, 'ok'); assert.strictEqual(await alertJob, 'ok');
     assert.ok(!calls.some(x => /symbol=L\d/.test(x.url)), 'dropped jobs never hit the network');
     const order = calls.slice(55).map(x => new URL(x.url).searchParams.get('symbol')); assert.deepStrictEqual(order, ['P1', 'AL1'], 'visible screen first');
+  });
+  const PUB = 'https://docs.google.com/spreadsheets/d/e/2PACX-FAKE_PUBLISHED_SHEET_ID_FOR_TESTS/pubhtml';
+  const SHARED = 'https://docs.google.com/spreadsheets/d/FAKE_SHARED_SHEET_ID_FOR_TESTS_0001/edit?usp=sharing#gid=0';
+  await test('Google Sheet: one CSV request prices every ASX ticker (no key, no Marketstack), cached 5 min', async () => {
+    const { src, calls, c } = setup({ sheet: PUB });
+    assert.strictEqual(src.asxMode(), 'sheet');
+    const codes = ['FANG', 'SEMI', 'IVV', 'BHP', 'STW'];
+    const r = await src.asxQuotes(codes, { prio: 3 });
+    assert.strictEqual(calls.length, 1); assert.strictEqual(calls[0].url, 'https://docs.google.com/spreadsheets/d/e/2PACX-FAKE_PUBLISHED_SHEET_ID_FOR_TESTS/pub?output=csv');
+    assert.ok(r.sheet && r.missing.length === 0);
+    for (const code of codes) { const q = src.peekAsxQuote(code), p = mocks.sheetPrice(code); assert.strictEqual(q.price, p.price, code); assert.strictEqual(q.prevClose, p.prev); assert.ok(q.sheet && !q.eod); }
+    assert.ok(Math.abs(src.peekAsxQuote('FANG').changePct - (mocks.sheetPrice('FANG').price / mocks.sheetPrice('FANG').prev - 1) * 100) < 1e-9);
+    assert.strictEqual(src.peekAsxQuote('FANG').t, Date.UTC(2026, 9, 8, 4, 20), '15:20 Sydney (AEDT, UTC+11) = 04:20 UTC');
+    await src.asxQuotes(codes); assert.strictEqual(calls.length, 1, 'served from the 5-minute cache');
+    c.advance(5 * 60e3 + 1); await src.asxQuotes(codes); assert.strictEqual(calls.length, 2, 'refetched after 5 min');
+    await src.asxQuotes(codes, { force: true }); assert.strictEqual(calls.length, 3, 'force refresh');
+    assert.ok(!calls.some(x => x.url.includes('marketstack')), 'no Marketstack calls in sheet mode');
+    assert.strictEqual(src.asxCost(codes), 0); assert.strictEqual(src.asxBudget().used, 0, 'Marketstack budget untouched');
+    assert.strictEqual(src.usage().shToday, 3);
+  });
+  await test('Google Sheet: tickers not in the sheet are flagged, #N/A cells flagged, works with a shared (gviz) link and without any API key', async () => {
+    const { src, calls, state } = setup({ sheet: SHARED, keys: { finnhub: '', twelvedata: '', marketstack: '' } });
+    state.sheetBlank = ['SEMI'];
+    const r = await src.asxQuotes(['FANG', 'SEMI', 'WTC']);
+    assert.strictEqual(calls[0].url, 'https://docs.google.com/spreadsheets/d/FAKE_SHARED_SHEET_ID_FOR_TESTS_0001/gviz/tq?tqx=out:csv&headers=1&gid=0');
+    assert.deepStrictEqual(r.missing, ['WTC']);
+    assert.ok(src.peekAsxQuote('WTC').notInSheet && src.peekAsxQuote('SEMI').sheetBlank && src.peekAsxQuote('FANG').price > 0);
+  });
+  await test('Google Sheet: sharing errors explained; stale prices kept on failure; a new link never shows the old sheet', async () => {
+    const { src, state, c, sheet, calls } = setup({ sheet: PUB });
+    state.sheetStatus = 401;
+    await assert.rejects(src.asxQuotes(['FANG']), e => e.type === 'sheet' && /Anyone with the link/.test(e.message) && /Publish to web/.test(e.message));
+    state.sheetStatus = 200; c.advance(61e3);
+    await src.asxQuotes(['FANG']); const p = src.peekAsxQuote('FANG').price;
+    c.advance(6 * 60e3); state.fail = true;
+    const r = await src.asxQuotes(['FANG']); assert.ok(!r.fresh && r.error && r.error.type === 'network', 'stale result flagged'); assert.strictEqual(src.peekAsxQuote('FANG').price, p, 'last price still shown');
+    state.fail = false; state.sheetCodes = ['FANG']; sheet.url = SHARED; const n = calls.length;
+    await src.asxQuotes(['FANG']); assert.strictEqual(calls.length, n + 1, 'new link fetched right away (cache is per link)');
+  });
+  await test('Google Sheet + Marketstack key: chart history from Marketstack does not overwrite the fresher sheet price', async () => {
+    const { src, calls } = setup({ sheet: PUB });
+    await src.asxQuotes(['FANG']); const p = src.peekAsxQuote('FANG').price;
+    const h = await src.asxHistory('FANG'); assert.ok(h.value.length > 200); assert.strictEqual(src.asxBudget().used, 1);
+    assert.strictEqual(src.peekAsxQuote('FANG').price, p); assert.ok(src.peekAsxQuote('FANG').sheet);
+    assert.strictEqual(calls.filter(x => x.url.includes('marketstack')).length, 1);
+  });
+  await test('ASX mode: sheet beats Marketstack; Marketstack alone still works as before; nothing set = none', async () => {
+    assert.strictEqual(setup({ sheet: PUB }).src.asxMode(), 'sheet');
+    assert.strictEqual(setup().src.asxMode(), 'marketstack');
+    assert.strictEqual(setup({ keys: { marketstack: '' } }).src.asxMode(), 'none');
+    assert.strictEqual(setup({ sheet: 'https://example.com/x.csv' }).src.asxMode(), 'marketstack', 'a non-Google link is ignored');
+  });
+  await test('fetchSheet (Settings → Test link): parses the CSV, rejects bad links and HTML pages', async () => {
+    const { fetch, state } = setup();
+    const r = await A.fetchSheet(fetch, PUB); assert.deepStrictEqual(Object.keys(r.quotes), mocks.SHEET_CODES); assert.strictEqual(r.kind, 'published');
+    await assert.rejects(A.fetchSheet(fetch, 'https://example.com/prices.csv'), /docs\.google\.com/);
+    await assert.rejects(A.fetchSheet(fetch, ''), e => e.type === 'nokey');
+    state.sheetStatus = 403; await assert.rejects(A.fetchSheet(fetch, SHARED), /HTTP 403/);
+    const html = async () => ({ ok: true, status: 200, text: async () => '<!DOCTYPE html><html><body>Sign in</body></html>' });
+    await assert.rejects(A.fetchSheet(html, SHARED), /web page instead of CSV/);
   });
   await test('usage() reports all four providers', async () => {
     const { src } = setup();

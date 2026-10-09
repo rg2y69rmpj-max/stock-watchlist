@@ -1,11 +1,11 @@
 /* Service worker: cache-first app shell, network-first market data.
    API responses are cached under a URL with any key parameter removed, so keys never land in Cache Storage.
    Notifications are only shown by the open app (no push: that would need a server); tapping one focuses the app. */
-const SHELL = 'stockwatch-shell-v3';
-const DATA = 'stockwatch-data-v3';
+const SHELL = 'stockwatch-shell-v4';
+const DATA = 'stockwatch-data-v4';
 const ASSETS = ['./', 'index.html', 'styles.css', 'logic.js', 'api.js', 'chart.js', 'app.js', 'manifest.webmanifest', 'data/default-watchlist.json', 'data/asx-watchlist.json',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png', 'icons/apple-touch-icon-180.png', 'favicon.ico'];
-const API_HOSTS = ['finnhub.io', 'api.twelvedata.com', 'api.marketstack.com', 'api.frankfurter.dev'];
+const API_HOSTS = ['finnhub.io', 'api.twelvedata.com', 'api.marketstack.com', 'api.frankfurter.dev', 'docs.google.com']; // docs.google.com: your ASX Google Sheet (CSV)
 const MAX_DATA_ENTRIES = 300;
 
 self.addEventListener('install', e => { e.waitUntil(caches.open(SHELL).then(c => c.addAll(ASSETS.map(a => new Request(a, { cache: 'reload' })))).then(() => self.skipWaiting())); });

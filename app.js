@@ -10,11 +10,12 @@
   const PROXIES = [{ sym: 'SPY', name: 'S&P 500', proxy: 'SPY ETF proxy' }, { sym: 'QQQ', name: 'Nasdaq-100', proxy: 'QQQ ETF proxy' }, { sym: 'DIA', name: 'Dow Jones', proxy: 'DIA ETF proxy' }];
   const ASX_PROXY = { code: 'STW', name: 'ASX 200', proxy: 'STW proxy · EOD' };
   const ASX_FREE_GAP = 'Finnhub\u2019s free tier covers US-listed stocks only';
+  const SHEET_NOTE = 'Google Finance via your sheet, delayed up to ~20 min';
   const DEF = { US: { list: [], meta: {}, cap: {} }, ASX: { list: [], meta: {}, cap: {} } };
   const WL_KEY = { US: L.KEYS.watchlist, ASX: L.KEYS.watchlistAsx };
   let wls = { US: null, ASX: null }, pf = null, alerts = null;
   let settings = readJSON(L.KEYS.settings, {}), keys = readJSON(L.KEYS.apiKeys, {});
-  settings = Object.assign({ demo: false, refreshSec: 120, range: '1D', market: 'US', msCap: A.LIMITS.marketstack.monthly }, settings);
+  settings = Object.assign({ demo: false, refreshSec: 120, range: '1D', market: 'US', msCap: A.LIMITS.marketstack.monthly, asxSheetUrl: '', includeKeysInBackup: false }, settings);
   let src = null, editMode = false, query = '', current = null, view = 'list', lastTab = 'list', latestAsOf = 0, refreshTimer = null, renderQueued = false, detailToken = 0, pfEditId = null;
   const rowErr = {}; // id -> short message
 
@@ -24,8 +25,11 @@
   const saveSettings = () => store.setItem(L.KEYS.settings, JSON.stringify(settings));
   const saveKeys = () => store.setItem(L.KEYS.apiKeys, JSON.stringify({ finnhub: keys.finnhub || '', twelvedata: keys.twelvedata || '', marketstack: keys.marketstack || '' }));
   const hasKey = k => !!(keys[k] || '').trim();
-  const hasLiveKey = () => hasKey('finnhub');
-  const asxLive = () => !!src && (src.demo || hasKey('marketstack'));
+  const sheetSet = () => { try { return !!L.normalizeSheetUrl(settings.asxSheetUrl); } catch (e) { return false; } };
+  const hasLiveKey = () => hasKey('finnhub') || sheetSet(); // a Google Sheet alone is enough for ASX prices
+  const asxMode = () => (!src ? 'none' : src.demo ? 'demo' : src.asxMode()); // 'sheet' | 'marketstack' | 'none' | 'demo'
+  const asxLive = () => asxMode() !== 'none';
+  const asxCodes = () => [...new Set(wl('ASX').symbols.map(s => s.symbol).concat(ASX_PROXY.code, pf.holdings.filter(h => h.exchange === 'ASX').map(h => h.symbol)))];
   const curOf = exchange => (exchange === 'ASX' ? 'AUD' : 'USD');
   const today = () => L.isoDate(new Date());
 
@@ -48,8 +52,14 @@
     const asxScreen = !!src && ((view === 'list' && market() === 'ASX') || (view === 'detail' && current && current.exchange === 'ASX'));
     if (asxScreen) {
       const dates = wls.ASX.symbols.concat([{ symbol: ASX_PROXY.code }]).map(x => quoteFor('ASX:' + x.symbol)).filter(Boolean).map(x => x.date).sort();
-      $('#asof').textContent = !asxLive() ? 'ASX prices: n/a (no free source)' : 'ASX end-of-day closes' + (dates.length ? ', latest ' + L.fmtBarTime(dates[dates.length - 1]) : '') + (demo ? ' (DEMO)' : '');
-    } else $('#asof').textContent = latestAsOf ? (demo ? 'generated ' : 'as of ') + L.fmtAsOf(latestAsOf) : (src && !demo ? 'waiting for prices…' : '');
+      const ts = asxMode() === 'sheet' ? wls.ASX.symbols.concat([{ symbol: ASX_PROXY.code }]).map(x => quoteFor('ASX:' + x.symbol)).filter(q => q && L.isNum(q.t)).map(q => q.t).sort((a, b) => a - b) : [];
+      $('#asof').textContent = !asxLive() ? 'ASX prices: not set up (free Google Sheet in Settings)'
+        : asxMode() === 'sheet' ? 'ASX prices from your Google Sheet, delayed' + (ts.length ? ', last trade ' + L.fmtAsOf(ts[ts.length - 1]) : '')
+        : 'ASX end-of-day closes' + (dates.length ? ', latest ' + L.fmtBarTime(dates[dates.length - 1]) : '') + (demo ? ' (DEMO)' : '');
+    } else {
+      const sheetTs = !latestAsOf && src && !demo && asxMode() === 'sheet' ? Math.max(0, ...wls.ASX.symbols.map(x => (quoteFor('ASX:' + x.symbol) || {}).t).filter(L.isNum)) : 0;
+      $('#asof').textContent = latestAsOf ? (demo ? 'generated ' : 'as of ') + L.fmtAsOf(latestAsOf) : sheetTs ? 'ASX from your Google Sheet, last trade ' + L.fmtAsOf(sheetTs) : (src && !demo ? 'waiting for prices…' : '');
+    }
     const u = src ? src.usage() : null;
     $('#queue').textContent = u && !demo && u.pending ? '· loading ' + u.pending + ' requests' : '';
     $('#foot').textContent = 'Not financial advice · ' + (demo ? 'DEMO data (synthetic)' : 'Delayed data' + (latestAsOf ? ', as of ' + L.fmtAsOf(latestAsOf) : ''));
@@ -63,7 +73,7 @@
     const names = Object.fromEntries(wls.US.symbols.map(s => [s.symbol, s.name]));
     pf.holdings.filter(h => h.exchange === 'US').forEach(h => { if (!names[h.symbol]) names[h.symbol] = h.symbol; });
     if (settings.demo) src = A.createDemoSource({ names, caps: DEF.US.cap });
-    else if (hasLiveKey()) src = A.createDataSource({ storage: store, fetch: (u, o) => window.fetch(u, Object.assign({ referrerPolicy: 'no-referrer', cache: 'no-store' }, o || {})), getKeys: () => keys, onEvent, marketstackCap: () => settings.msCap });
+    else if (hasLiveKey()) src = A.createDataSource({ storage: store, fetch: (u, o) => window.fetch(u, Object.assign({ referrerPolicy: 'no-referrer', cache: 'no-store' }, o || {})), getKeys: () => keys, onEvent, marketstackCap: () => settings.msCap, getSheetUrl: () => settings.asxSheetUrl });
     else src = null;
     if (src) src.prune();
     updateStatus();
@@ -91,6 +101,7 @@
     if (v !== 'detail') current = null;
     if (src) src.focus(v); // drop queued requests for screens you left, so the visible one goes first
     if (v === 'list') { $('#title').textContent = 'Watchlist'; renderList(); loadList(); }
+    renderNudge();
     if (v === 'setup') $('#title').textContent = 'Set up';
     if (v === 'settings') { $('#title').textContent = 'Settings'; renderSettings(); }
     if (v === 'detail') openDetail(arg);
@@ -119,6 +130,7 @@
     if (m === 'ASX') {
       const q = src ? src.peekAsxQuote(s.symbol) : null, quote = q && !q.notFound ? q : null, hist = src ? src.peekAsxHistory(s.symbol) : null;
       return { symbol: s.symbol, id: L.makeId(s.symbol, 'ASX'), name: s.name || '', price: quote ? quote.price : null, changePct: quote ? quote.changePct : null, date: quote ? quote.date : null,
+        sheet: !!(quote && quote.sheet), timeText: quote && quote.timeText ? quote.timeText : '', notInSheet: !!(q && q.notInSheet), sheetBlank: !!(q && q.sheetBlank),
         marketCap: DEF.ASX.cap[s.symbol] ?? null, liveCap: null, notFound: !!(q && q.notFound), spark: hist && hist.length > 1 ? hist.slice(-22).map(b => b.c) : null };
     }
     const q = src ? src.peekQuote(s.symbol) : null, p = src ? src.peekProfile(s.symbol) : null;
@@ -138,7 +150,7 @@
     $('#sortKey').value = w.sort.key; $('#sortDir').textContent = w.sort.dir === 'asc' ? '↑' : '↓';
     $('#favFirst').setAttribute('aria-pressed', String(w.favouritesFirst)); $('#editBtn').setAttribute('aria-pressed', String(editMode));
     $('#editBtn').textContent = editMode ? 'Done' : 'Edit';
-    $('#pxHead').textContent = m === 'ASX' ? 'Close · Day (A$)' : 'Price · Day';
+    $('#pxHead').textContent = m === 'ASX' ? (asxMode() === 'sheet' ? 'Price · Day (A$)' : 'Close · Day (A$)') : 'Price · Day';
     $('#addInput').placeholder = m === 'ASX' ? 'ASX code, e.g. WTC' : 'Ticker, e.g. IBM';
     const favs = new Set(w.favourites);
     const all = w.symbols.map(rowData);
@@ -152,8 +164,12 @@
         : `<button class="star${fav ? ' on' : ''}" data-fav="${esc(r.symbol)}" aria-label="Favourite ${esc(r.symbol)}" aria-pressed="${fav}" type="button">${fav ? '★' : '☆'}</button>`;
       let sub = r.notFound ? '<span class="err-t">No price found. Check the ticker.</span>' : rowErr[r.id] ? `<span class="err-t">${esc(rowErr[r.id])}</span>`
         : esc(r.name) + (r.liveCap ? ' · ' + L.fmtBig(r.liveCap) : '');
-      if (m === 'ASX' && !r.notFound && !rowErr[r.id]) sub = esc(r.name) + (r.date ? ' · close ' + shortDate(r.date) : '');
-      const px = asxNa ? `<div class="px"><div class="price na" data-na="1">n/a</div><span class="pill flat">no free source</span></div>`
+      if (m === 'ASX' && !rowErr[r.id]) {
+        if (r.notInSheet) sub = '<span class="err-t">Not in your sheet yet: Settings \u2192 ASX prices \u2192 Copy formula</span>';
+        else if (r.sheetBlank) sub = '<span class="err-t">Google Finance has no price for ASX:' + esc(r.symbol) + '</span>';
+        else if (!r.notFound) sub = esc(r.name) + (r.timeText ? ' · ' + esc(r.timeText.slice(11)) : r.date ? (r.sheet ? ' · ' : ' · close ') + shortDate(r.date) : '');
+      }
+      const px = asxNa ? `<div class="px"><div class="price na" data-na="1">n/a</div><span class="pill flat">set up</span></div>`
         : `<div class="px"><div class="price">${L.fmtPrice(r.price, cur)}</div><span class="pill ${dir}">${L.fmtPct(r.changePct)}</span></div>`;
       return [left, `<div class="min0"><div class="tk">${esc(r.symbol)}</div><div class="nm">${sub}</div></div>`,
         sp ? `<svg class="spark ${sdir}" viewBox="0 0 72 28" preserveAspectRatio="none" aria-hidden="true"><path d="${L.sparkPath(sp, 72, 28)}"/></svg>` : '<div class="spark-empty" aria-hidden="true"></div>', px];
@@ -168,7 +184,7 @@
     }
     $('#listEmpty').hidden = rows.length > 0;
     $('#listNote').textContent = m === 'US' && src && !src.demo && !hasKey('twelvedata') ? 'Sparklines and charts need a free Twelve Data key (Settings).'
-      : m === 'ASX' ? 'ASX list: the three portfolio ETFs plus the top 20 ASX companies by market cap (snapshot ' + (DEF.ASX.meta.asOf || '?') + '). Prices are end-of-day closes in AUD.' : '';
+      : m === 'ASX' ? 'ASX list: the three portfolio ETFs plus the top 20 ASX companies by market cap (snapshot ' + (DEF.ASX.meta.asOf || '?') + '). ' + (asxMode() === 'sheet' ? 'Prices in AUD from Google Finance via your sheet, delayed up to ~20 min.' : 'Prices are end-of-day closes in AUD.') : '';
     renderOverview(all);
     renderAsxBar();
     updateStatus();
@@ -182,34 +198,43 @@
     if (m === 'US') tiles = PROXIES.map(p => tile(p.name, p.proxy, p.sym, quoteFor(p.sym), 'USD')).join('');
     else {
       const q = asxLive() ? quoteFor('ASX:' + ASX_PROXY.code) : null;
-      tiles = asxLive() ? tile(ASX_PROXY.name, ASX_PROXY.proxy, 'ASX:' + ASX_PROXY.code, q, 'AUD')
+      tiles = asxLive() ? tile(ASX_PROXY.name, asxMode() === 'sheet' ? 'STW proxy · delayed' : ASX_PROXY.proxy, 'ASX:' + ASX_PROXY.code, q, 'AUD')
         : `<div class="ov-tile na-tile"><div class="n">${ASX_PROXY.name}</div><div class="p">${ASX_PROXY.proxy}</div><div class="v na">n/a</div></div>`;
-      tiles += `<div class="ov-tile na-tile" style="grid-column: span 2"><div class="p" style="white-space:normal">${asxLive() ? 'ASX 200 shown via the STW ETF (end-of-day close). Index points aren\u2019t on any free tier.' : 'Needs a free Marketstack key for end-of-day closes. No free source has live ASX prices.'}</div></div>`;
+      tiles += `<div class="ov-tile na-tile" style="grid-column: span 2"><div class="p" style="white-space:normal">${asxMode() === 'sheet' ? 'ASX 200 shown via the STW ETF (price from your Google Sheet). Index points aren\u2019t shown.' : asxLive() ? 'ASX 200 shown via the STW ETF (end-of-day close). Index points aren\u2019t on any free tier.' : 'Connect your free Google Sheet in Settings to see ASX prices.'}</div></div>`;
     }
     const mv = L.topMovers(rows, 5);
     const ol = arr => arr.length ? `<ol>${arr.map(r => `<li data-go="${esc(r.id)}"><b>${esc(r.symbol)}</b><span class="${L.direction(r.changePct)}-t">${L.fmtPct(r.changePct)}</span></li>`).join('')}</ol>` : '<p class="small muted" style="margin:0">—</p>';
     const anyQuotes = rows.some(r => L.isNum(r.changePct));
     el.innerHTML = `<div class="ov-tiles">${tiles}</div>` +
-      (anyQuotes ? `<div class="movers"><div id="gainers"><h3>Top gainers${m === 'ASX' ? ' (EOD)' : ''}</h3>${ol(mv.gainers)}</div><div id="losers"><h3>Top losers${m === 'ASX' ? ' (EOD)' : ''}</h3>${ol(mv.losers)}</div></div>`
+      (anyQuotes ? `<div class="movers"><div id="gainers"><h3>Top gainers${m === 'ASX' && asxMode() !== 'sheet' ? ' (EOD)' : ''}</h3>${ol(mv.gainers)}</div><div id="losers"><h3>Top losers${m === 'ASX' && asxMode() !== 'sheet' ? ' (EOD)' : ''}</h3>${ol(mv.losers)}</div></div>`
         : `<div class="ov-note">${m === 'ASX' && !asxLive() ? 'Top movers: n/a without ASX prices.' : 'Top movers in your watchlist appear once prices load.'}</div>`) +
-      (m === 'ASX' && !anyQuotes ? '' : `<div class="ov-note">${m === 'US' ? 'Index levels aren\u2019t on the free tiers, so the ETFs that track them are shown as proxies (ETF prices in USD, not index points).' : 'Movers are from your ASX list, by latest end-of-day change.'}${src.demo ? ' DEMO numbers.' : ''}</div>`);
+      (m === 'ASX' && !anyQuotes ? '' : `<div class="ov-note">${m === 'US' ? 'Index levels aren\u2019t on the free tiers, so the ETFs that track them are shown as proxies (ETF prices in USD, not index points).' : (asxMode() === 'sheet' ? 'Movers are from your ASX list, by today\u2019s change (delayed).' : 'Movers are from your ASX list, by latest end-of-day change.')}${src.demo ? ' DEMO numbers.' : ''}</div>`);
   }
   function renderAsxBar() {
     const el = $('#asxBar');
     if (market() !== 'ASX' || !src) { el.hidden = true; return; }
     el.hidden = false;
-    if (src.demo) { el.innerHTML = '<p><b>DEMO</b>: synthetic end-of-day closes in AUD. With real keys, ASX prices come from Marketstack (end-of-day only).</p>'; return; }
-    if (!hasKey('marketstack')) {
-      el.innerHTML = `<p><b>ASX prices: n/a.</b> We couldn\u2019t find a free source with live ASX quotes that a web app can call: Twelve Data and Finnhub free plans cover US markets only. A free Marketstack key gives end-of-day closes (100 requests a month).</p><button type="button" class="ghost wide" id="asxSettings">Add a Marketstack key in Settings</button>`;
+    if (src.demo) { el.innerHTML = '<p><b>DEMO</b>: synthetic end-of-day closes in AUD. With real data, ASX prices come from your own free Google Sheet (Google Finance, delayed).</p>'; return; }
+    const mode = asxMode();
+    if (mode === 'none') {
+      el.innerHTML = `<p><b>ASX prices aren\u2019t set up yet.</b> The free plans of Finnhub and Twelve Data don\u2019t include the ASX. A Google Sheet you own can fetch Google Finance prices for FANG, SEMI, IVV and the rest for free (no card, no key, delayed up to ~20 min). Setup takes about 3 minutes.</p><button type="button" class="primary wide" id="asxSettings">Set up free ASX prices</button>`;
+      return;
+    }
+    if (mode === 'sheet') {
+      const missing = wl('ASX').symbols.map(s => s.symbol).filter(c => { const q = src.peekAsxQuote(c); return q && q.notInSheet; });
+      el.innerHTML = `<p>ASX prices from <b>your Google Sheet</b> (Google Finance, delayed up to ~20 min; Google refreshes the sheet about every 5 min). Free, no key.</p>` +
+        (asxErr ? `<p class="err-t" id="asxErr">${esc(asxErr)}</p>` : '') +
+        (missing.length ? `<p id="asxMissing">${missing.length} ticker${missing.length === 1 ? ' isn\u2019t' : 's aren\u2019t'} in your sheet: ${esc(missing.join(', '))}. Copy the updated formula and paste it over cell A1.</p><button type="button" class="ghost wide" id="asxCopy">Copy updated formula</button>` : '');
       return;
     }
     const codes = wl('ASX').symbols.map(s => s.symbol).concat(ASX_PROXY.code), cost = src.asxCost(codes), b = src.asxBudget();
     const can = cost > 0 && cost <= b.left;
-    el.innerHTML = `<p>End-of-day closes from Marketstack. Each ticker costs 1 request: <b id="msLeft">${b.left} of ${b.cap}</b> left this month on this device. Closes are kept until the next ASX close is out (after 6 pm Sydney time on trading days).</p>` +
+    el.innerHTML = `<p>End-of-day closes from Marketstack (optional fallback; a free Google Sheet in Settings gives delayed prices with no monthly limit). Each ticker costs 1 request: <b id="msLeft">${b.left} of ${b.cap}</b> left this month on this device. Closes are kept until the next ASX close is out (after 6 pm Sydney time on trading days).</p>` +
       `<button type="button" class="primary wide" id="asxLoad" ${can ? '' : 'disabled'}>${cost === 0 ? 'All closes are up to date' : can ? `Load closes for ${cost} tickers (uses ${cost} requests)` : `Not enough requests left (${cost} needed)`}</button>`;
   }
   $('#asxBar').addEventListener('click', e => {
-    if (e.target.closest('#asxSettings')) { go('#/settings'); return; }
+    if (e.target.closest('#asxSettings')) { go('#/settings'); setTimeout(() => { const c = $('#asxCard'); if (c) c.scrollIntoView({ block: 'start' }); }, 50); return; }
+    if (e.target.closest('#asxCopy')) { copyFormula($('#asxCopy')); return; }
     if (e.target.closest('#asxLoad')) {
       const codes = wl('ASX').symbols.map(s => s.symbol).concat(ASX_PROXY.code);
       $('#asxLoad').disabled = true; $('#asxLoad').textContent = 'Loading…';
@@ -224,7 +249,10 @@
   function visibleOrder() { return [...document.querySelectorAll('#list li')].map(li => li.dataset.sym); }
   function loadList(force) {
     if (!src) return;
-    if (market() === 'ASX') { renderList(); return; } // ASX closes only load when you tap the button (monthly budget)
+    if (market() === 'ASX') { // Google Sheet: one free request for every ticker. Marketstack closes only load when you tap the button (monthly budget).
+      if (asxMode() === 'sheet') loadSheet(force, 'list-asx');
+      renderList(); return;
+    }
     PROXIES.forEach(p => src.quote(p.sym, { force, prio: 2, view: 'list' }).then(r => { if (r.value && r.value.t) noteAsOf(r.value.t); scheduleRender(); }).catch(() => {}));
     const order = visibleOrder().length ? visibleOrder() : wl('US').symbols.map(s => s.symbol);
     order.forEach((s, i) => {
@@ -234,6 +262,12 @@
     order.forEach(s => src.profile(s, { view: 'list' }).then(r => { if (r.value && r.value.name && L.setName(wl('US'), s, r.value.name)) saveWl('US'); scheduleRender(); }).catch(() => {}));
     src.sparklines(order, scheduleRender, 'list').catch(() => {});
     updateStatus();
+  }
+  let asxErr = '';
+  function loadSheet(force, viewTag) {
+    return src.asxQuotes(asxCodes(), { force, prio: 2, view: viewTag, onUpdate: scheduleRender })
+      .then(r => { asxErr = r.error ? 'Couldn\u2019t refresh from your sheet (' + r.error.message + '). Showing the last prices.' : ''; scheduleRender(); queueAlertCheck(); })
+      .catch(e => { if (e.type !== 'cancelled') { asxErr = e.message; scheduleRender(); } });
   }
   function tick(force) {
     if (!src || document.visibilityState !== 'visible') return;
@@ -254,7 +288,8 @@
   $('#favFirst').onclick = () => { wl().favouritesFirst = !wl().favouritesFirst; saveWl(); renderList(); };
   $('#editBtn').onclick = () => { editMode = !editMode; renderList(); };
   $('#refresh').onclick = () => {
-    if (market() === 'ASX') { banner(src && !src.demo && hasKey('marketstack') ? 'ASX closes change once a day. Use the Load button above (each ticker costs 1 Marketstack request).' : 'ASX prices are end-of-day only.', 'info', 5000); return; }
+    if (market() === 'ASX' && asxMode() === 'sheet') { loadList(true); banner('Refreshing ASX prices from your Google Sheet…', 'info', 2500); return; }
+    if (market() === 'ASX') { banner(src && !src.demo && hasKey('marketstack') ? 'ASX closes change once a day. Use the Load button above (each ticker costs 1 Marketstack request).' : 'Set up free ASX prices (your own Google Sheet) in Settings.', 'info', 5000); return; }
     loadList(true); refreshAlertQuotes(); banner('Refreshing prices (rate-limited to stay inside the free tier)…', 'info', 3000);
   };
   $('#addBtn').onclick = () => { $('#addForm').hidden = !$('#addForm').hidden; if (!$('#addForm').hidden) $('#addInput').focus(); $('#addMsg').textContent = ''; };
@@ -318,7 +353,11 @@
   }
   function openAsxDetail() {
     currentDetailState = null;
-    $('#dNote').textContent = 'ASX: end-of-day closes in AUD' + (src.demo ? ' (DEMO)' : ' from Marketstack') + '. Intraday (1D, 5D) and 5Y history aren\u2019t available on a free tier. Ratings, price targets, most metrics, news and earnings dates are n/a: ' + ASX_FREE_GAP + '.';
+    const mode = asxMode();
+    $('#dNote').textContent = (mode === 'sheet' ? 'ASX: price in AUD from ' + SHEET_NOTE + '. ' + (hasKey('marketstack') ? 'Chart: 1 year of end-of-day closes from Marketstack. ' : 'The chart needs the optional Marketstack key (1 year of end-of-day closes). ')
+      : mode === 'none' ? 'ASX prices aren\u2019t set up yet: connect your free Google Sheet in Settings \u2192 ASX prices. '
+      : 'ASX: end-of-day closes in AUD' + (src.demo ? ' (DEMO)' : ' from Marketstack') + '. ') +
+      'Intraday (1D, 5D) and 5Y history aren\u2019t available free. Ratings, price targets, most metrics, news and earnings dates are n/a: ' + ASX_FREE_GAP + '.';
     const na = `<span class="na">n/a: ${ASX_FREE_GAP}</span>`;
     $('#ratings').innerHTML = na;
     $('#targets').innerHTML = ['Average', 'High', 'Low'].map(k => `<div class="kv"><span class="muted">${k}</span><span class="na" data-target="${k.toLowerCase()}">n/a (not on free tier for ASX)</span></div>`).join('');
@@ -335,7 +374,7 @@
       ['Volume (last session)', last && L.isNum(last.v) ? L.fmtVolume(last.v) : bars ? L.NA_NONE : '…'],
       ['Market cap', NA], ['P/E (trailing)', NA], ['EPS (TTM)', NA], ['Dividend yield', NA], ['Beta', NA], ['Next earnings', NA]
     ];
-    if (!src.demo && !hasKey('marketstack')) items.slice(0, 3).forEach(i => { i[1] = 'n/a (needs Marketstack key)'; });
+    if (!src.demo && !hasKey('marketstack')) items.slice(0, 3).forEach(i => { i[1] = 'n/a (needs 1 year of closes: optional Marketstack key)'; });
     $('#metrics').innerHTML = items.map(([k, v]) => `<div><dt>${k}</dt><dd class="${/^n\/a/.test(v) ? 'na' : ''}" data-metric="${esc(k)}">${esc(v)}</dd></div>`).join('');
   }
   function renderFav() {
@@ -355,7 +394,8 @@
     if (!q || q.notFound) { $('#dPrice').textContent = '—'; $('#dChange').innerHTML = '<span class="err-t">No price found for this ticker.</span>'; return; }
     $('#dPrice').textContent = L.fmtPrice(q.price, cur);
     const d = L.direction(q.change);
-    const when = q.eod ? (src.demo ? ' · DEMO end-of-day' : ' · end-of-day close, ' + esc(L.fmtBarTime(q.date))) : (src.demo ? ' · DEMO' : ' · delayed, as of ' + esc(L.fmtAsOf(q.t)));
+    const when = q.sheet ? ' · ' + SHEET_NOTE + (L.isNum(q.t) ? ', last trade ' + esc(L.fmtAsOf(q.t)) : '')
+      : q.eod ? (src.demo ? ' · DEMO end-of-day' : ' · end-of-day close, ' + esc(L.fmtBarTime(q.date))) : (src.demo ? ' · DEMO' : ' · delayed, as of ' + esc(L.fmtAsOf(q.t)));
     $('#dChange').innerHTML = `<span class="${d}-t">${L.fmtChange(q.change)} (${L.fmtPct(q.changePct)})</span> <span class="muted small">${q.eod ? 'vs previous close' : 'today'}${when}${r.fresh === false ? ' · cached' : ''}</span>`;
   }
   function loadChart() {
@@ -365,17 +405,27 @@
     chart.set([], { message: 'Loading chart…', demo: src.demo, range });
     const stale = () => token !== detailToken || range !== effRange();
     if (c.exchange === 'ASX') {
-      if (!src.demo && !hasKey('marketstack')) {
-        chart.set([], { message: 'ASX prices: n/a without a Marketstack key', demo: false, range });
+      const mode = asxMode();
+      if (mode === 'none') {
+        chart.set([], { message: 'ASX prices aren\u2019t set up yet', demo: false, range });
         $('#dPrice').innerHTML = '<span class="na" style="font-size:16px">n/a</span>';
-        $('#dChange').innerHTML = '<span class="muted small">No free source has live ASX prices. Add a free Marketstack key in Settings for end-of-day closes.</span>';
+        $('#dChange').innerHTML = '<span class="muted small">Connect your free Google Sheet (Settings \u2192 ASX prices) to see ASX prices. No card or key needed.</span>';
         renderAsxMetrics(null); return;
+      }
+      if (mode === 'sheet') {
+        const showSheet = () => { const q = src.peekAsxQuote(c.symbol); if (stale()) return; if (q && q.notInSheet) { $('#dPrice').textContent = '—'; $('#dChange').innerHTML = '<span class="err-t">Not in your sheet yet. Settings \u2192 ASX prices \u2192 Copy formula, then paste it over cell A1.</span>'; } else renderQuote({ value: q || { notFound: true } }); queueAlertCheck(); };
+        src.asxQuotes([c.symbol], { prio: 0, view: 'detail' }).then(showSheet).catch(e => { if (!stale() && e.type !== 'cancelled') { $('#dChange').innerHTML = `<span class="err-t">${esc(e.message)}</span>`; showSheet(); } });
+        if (!hasKey('marketstack')) {
+          chart.set([], { message: 'Chart needs the optional Marketstack key', demo: false, range });
+          $('#chartMsg').textContent = 'Google Sheets can\u2019t share GOOGLEFINANCE price history with other apps, so ASX charts need a free Marketstack key (1 year of end-of-day closes, 100 requests a month). Prices work without it.';
+          renderAsxMetrics(null); return;
+        }
       }
       src.asxHistory(c.symbol, { prio: 0, view: 'detail' }).then(r => {
         if (stale()) return;
         const bars = r.value || [];
         const q = bars.length ? L.eodQuote(bars) : null;
-        renderQuote({ value: q || { notFound: true }, fresh: r.fresh });
+        if (mode !== 'sheet') renderQuote({ value: q || { notFound: true }, fresh: r.fresh });
         chart.set(L.sliceRange(bars, range), { intraday: false, range, demo: src.demo, message: 'No end-of-day data for this range' });
         const ch = L.rangeChange(L.sliceRange(bars, range));
         if (ch) $('#dRangeChange').innerHTML = `<span class="${L.direction(ch.change)}-t">${L.fmtPct(ch.changePct)}</span> over ${range} (end-of-day closes${src.demo ? ', DEMO' : ''})`;
@@ -386,7 +436,7 @@
         if (stale() || e.type === 'cancelled') return;
         chart.set([], { message: e.type === 'budget' ? 'Monthly Marketstack budget used' : 'Chart unavailable', demo: src.demo, range });
         $('#chartMsg').textContent = e.message; renderAsxMetrics([]);
-        $('#dPrice').innerHTML = '<span class="na" style="font-size:16px">n/a</span>';
+        if (mode !== 'sheet') $('#dPrice').innerHTML = '<span class="na" style="font-size:16px">n/a</span>';
       });
       return;
     }
@@ -475,12 +525,13 @@
     $('#pfFx').innerHTML = fxTxt;
     const notes = [];
     if (src.demo) notes.push('DEMO prices and rate (synthetic). Your units and costs are your own entries.');
-    if (!src.demo && !hasKey('marketstack') && pf.holdings.some(h => h.exchange === 'ASX' && h.units > 0)) notes.push('ASX values: n/a. No free source has live ASX prices; add a free Marketstack key (Settings) for end-of-day closes.');
+    if (asxMode() === 'none' && pf.holdings.some(h => h.exchange === 'ASX' && h.units > 0)) notes.push('ASX values: n/a until you connect your free Google Sheet (Settings \u2192 ASX prices).');
+    if (asxMode() === 'sheet' && pf.holdings.some(h => h.exchange === 'ASX')) notes.push('ASX prices: ' + SHEET_NOTE + '.');
     if (sum.missing.length) notes.push('Not in the total (no price yet): ' + sum.missing.join(', ') + '.');
     if (sum.fxMissing) notes.push('US holdings are left out until a USD/AUD rate loads.');
     $('#pfNote').innerHTML = notes.map(esc).join('<br>');
     $('#pfList').innerHTML = sum.rows.map(r => {
-      const cur = r.currency, priceTxt = r.price === null ? (r.exchange === 'ASX' && !asxLive() ? 'n/a' : '—') : L.fmtPrice(r.price, cur) + (r.exchange === 'ASX' ? ' close' : '');
+      const cur = r.currency, priceTxt = r.price === null ? (r.exchange === 'ASX' && !asxLive() ? 'n/a' : '—') : L.fmtPrice(r.price, cur) + (r.exchange === 'ASX' && !(quoteFor(r.id) || {}).sheet ? ' close' : '');
       const right = r.needsInput && !(r.units > 0) ? '<span class="needs">Enter units and cost</span>' : r.value === null ? '<span class="na">n/a</span>' : `<b>${L.fmtPrice(r.value, 'AUD')}</b>`;
       const gain = r.avgCost === null ? '<span class="needs">Add average cost</span>' : r.gain === null ? '—' : `<span class="${L.direction(r.gain)}-t">${L.fmtSignedMoney(r.gain, 'AUD')} (${L.fmtPct(r.gainPct)})</span>`;
       return `<li data-hid="${esc(r.id)}"><div class="pf-row"><span><span class="tk">${esc(r.symbol)}</span><span class="xchip">${r.exchange}</span></span>${right}</div>` +
@@ -491,10 +542,10 @@
   }
   function loadPortfolio(force) {
     if (!src) return;
-    const us = pf.holdings.filter(h => h.exchange === 'US'), asx = pf.holdings.filter(h => h.exchange === 'ASX' && h.units > 0).map(h => h.symbol);
+    const us = pf.holdings.filter(h => h.exchange === 'US'), asx = pf.holdings.filter(h => h.exchange === 'ASX' && (h.units > 0 || asxMode() === 'sheet')).map(h => h.symbol);
     us.forEach(h => src.quote(h.symbol, { force, prio: 3, view: 'portfolio' }).then(r => { if (r.value && r.value.t) noteAsOf(r.value.t); scheduleRender(); queueAlertCheck(); }).catch(() => {}));
     if (asx.length && asxLive()) src.asxQuotes(asx, { prio: 3, view: 'portfolio', onUpdate: scheduleRender }).then(() => { scheduleRender(); queueAlertCheck(); })
-      .catch(e => { if (e.type !== 'cancelled') { $('#pfNote').textContent = 'ASX closes: ' + e.message; } });
+      .catch(e => { if (e.type !== 'cancelled') { $('#pfNote').textContent = 'ASX prices: ' + e.message; } });
     if (us.some(h => h.units > 0)) src.fx({ prio: 3 }).then(scheduleRender).catch(e => { if (e.type !== 'cancelled') $('#pfFx').textContent = 'USD→AUD rate unavailable: ' + e.message; });
   }
   function openPfForm(h) {
@@ -569,8 +620,9 @@
   function refreshAlertQuotes() {
     if (!src) return;
     const us = [...new Set(alerts.rules.filter(r => r.enabled && !r.sym.startsWith('ASX:')).map(r => r.sym))];
-    if (!us.length) { queueAlertCheck(); return; }
-    Promise.allSettled(us.map(s => src.quote(s, { prio: 5 }))).then(() => { if (view === 'list') scheduleRender(); checkAlerts(); });
+    const asx = asxMode() === 'sheet' && alerts.rules.some(r => r.enabled && r.sym.startsWith('ASX:')) ? [src.asxQuotes(asxCodes(), { prio: 5 })] : [];
+    if (!us.length && !asx.length) { queueAlertCheck(); return; }
+    Promise.allSettled(us.map(s => src.quote(s, { prio: 5 })).concat(asx)).then(() => { if (view === 'list') scheduleRender(); checkAlerts(); });
   }
   function notify(e) {
     window.__app.notifyCount = (window.__app.notifyCount || 0) + 1;
@@ -600,7 +652,7 @@
     $('#alRules').innerHTML = alerts.rules.map(r => {
       const { symbol, exchange } = L.parseId(r.sym), q = quoteFor(r.sym);
       return `<li data-rule="${esc(r.id)}"><div><b>${esc(symbol)}</b>${exchange === 'ASX' ? '<span class="xchip">ASX</span>' : ''} ${esc(ruleTxt(r))}` +
-        `<div class="sub">${q ? 'now ' + L.fmtPrice(q.price, curOf(exchange)) + (q.eod ? ' (close)' : '') + ' · ' + L.fmtPct(q.changePct) : exchange === 'ASX' && !asxLive() ? 'no ASX price (needs Marketstack key)' : 'waiting for a price'}${r.type !== 'movePct' && r.armed === false ? ' · fired, re-arms when price moves back' : ''}</div></div>` +
+        `<div class="sub">${q ? 'now ' + L.fmtPrice(q.price, curOf(exchange)) + (q.eod ? ' (close)' : '') + ' · ' + L.fmtPct(q.changePct) : exchange === 'ASX' && !asxLive() ? 'no ASX price yet (connect your Google Sheet in Settings)' : 'waiting for a price'}${r.type !== 'movePct' && r.armed === false ? ' · fired, re-arms when price moves back' : ''}</div></div>` +
         `<div class="row"><button type="button" class="chip" data-toggle="${esc(r.id)}" aria-pressed="${r.enabled}">${r.enabled ? 'On' : 'Off'}</button><button type="button" class="chip" data-del="${esc(r.id)}" aria-label="Delete alert">✕</button></div></li>`;
     }).join('') || '<li class="muted small">No alerts yet.</li>';
     $('#alHistory').innerHTML = alerts.history.map(h => `<li class="${h.seen ? '' : 'unseen'}" data-hist="${esc(h.id)}"><div>${esc(L.alertMessage(h))}<div class="sub">${esc(L.fmtAsOf(h.t))}</div></div></li>`).join('') || '<li class="muted small">Nothing has fired yet.</li>';
@@ -629,17 +681,18 @@
     const f = $('#keysForm'); f.finnhub.value = keys.finnhub || ''; f.twelvedata.value = keys.twelvedata || ''; f.marketstack.value = keys.marketstack || '';
     $('#demoToggle').checked = !!settings.demo; $('#refreshSel').value = String(settings.refreshSec); $('#msCap').value = String(settings.msCap);
     $('#defaultInfo').textContent = `US list: top ${DEF.US.list.length} S&P 500 companies by market cap (snapshot ${DEF.US.meta.asOf || '?'}); you have ${wls.US.symbols.length} tickers. ASX list: 3 ETFs + top ${Math.max(0, DEF.ASX.list.length - 3)} ASX companies (snapshot ${DEF.ASX.meta.asOf || '?'}); you have ${wls.ASX.symbols.length}. Reset doesn\u2019t touch your portfolio or alerts.`;
-    renderUsage();
+    renderUsage(); renderSheet(); renderBackup();
   }
   function renderUsage() {
     if ($('#v-settings').hidden) return;
     const u = src ? src.usage() : null;
-    if (!u || src.demo) { $('#usage').innerHTML = '<p class="muted">No API calls in DEMO mode.</p>'; return; }
+    if (!u || src.demo) { $('#usage').innerHTML = `<p class="muted">${src ? 'No API calls in DEMO mode.' : 'No data source set up yet.'}</p>`; return; }
     const row = (name, txt) => `<tr><td>${name}</td><td>${txt}</td></tr>`;
     $('#usage').innerHTML = '<table class="usage-t" id="usageTable">' +
       row('Finnhub', `<span data-usage="finnhub">${u.fhLastMinute}/${u.limits.finnhub.max} calls in the last minute (free limit 60), ${u.fhToday} today</span>${u.fhPausedMs ? ', paused ' + Math.ceil(u.fhPausedMs / 1000) + ' s after hitting the limit' : ''}`) +
       row('Twelve Data', hasKey('twelvedata') ? `<span data-usage="twelvedata">${u.tdLastMinute}/8 credits this minute, ${u.tdToday}/800 today</span> (resets 00:00 UTC)` : '<span class="muted" data-usage="twelvedata">No key: charts, sparklines and live USD/AUD are off</span>') +
-      row('Marketstack', hasKey('marketstack') ? `<span data-usage="marketstack">${u.ms.used}/${u.ms.cap} requests this month</span> (${u.ms.month}, counted on this device; your account\u2019s 100 reset on its billing date)` : '<span class="muted" data-usage="marketstack">No key: ASX prices are n/a</span>') +
+      row('Marketstack', hasKey('marketstack') ? `<span data-usage="marketstack">${u.ms.used}/${u.ms.cap} requests this month</span> (${u.ms.month}, counted on this device; your account\u2019s 100 reset on its billing date)` : '<span class="muted" data-usage="marketstack">No key (optional): no ASX charts</span>') +
+      row('Google Sheet', sheetSet() ? `<span data-usage="sheet">${u.shToday} today</span> (no key or limit; ASX prices cached 5 min)` : '<span class="muted" data-usage="sheet">Not connected: ASX prices are off</span>') +
       row('Frankfurter', `<span data-usage="frankfurter">${u.frToday} today</span> (no key; ECB rate cached 6 h)`) +
       row('Waiting', `${u.pending} queued request${u.pending === 1 ? '' : 's'} (the screen you\u2019re on goes first)`) + '</table>';
   }
@@ -670,6 +723,137 @@
   };
   $('#clearCache').onclick = () => { if (src) src.clearCache(); L.createCache(store).clear(); makeSource(); $('#listMsg').textContent = 'Cached market data cleared.'; };
 
+  /* ---------- ASX prices: your Google Sheet ---------- */
+  const plainFetch = (u, o) => window.fetch(u, Object.assign({ referrerPolicy: 'no-referrer', cache: 'no-store' }, o || {}));
+  function renderGuide() { // plain-language steps from logic.js (same text as the README)
+    const G = L.SHEET_GUIDE, li = t => { const e = document.createElement('li'); e.textContent = t; return e; };
+    $('#sheetHowTitle').textContent = G.title;
+    $('#sheetSteps').replaceChildren(...G.steps.map(li));
+    $('#sheetByHandHead').textContent = G.byHand[0];
+    $('#sheetByHand').textContent = G.byHand.slice(1, -1).join('\n');
+    $('#sheetByHandTail').textContent = G.byHand[G.byHand.length - 1];
+    $('#sheetNotes').replaceChildren(...G.notes.map(li));
+  }
+  renderGuide();
+  function renderSheet() {
+    $('#sheetUrl').value = settings.asxSheetUrl || '';
+    $('#sheetRemove').hidden = !settings.asxSheetUrl;
+    $('#sheetFormula').value = L.sheetFormula(asxCodes());
+  }
+  async function copyFormula(btn) {
+    const codes = asxCodes(), f = L.sheetFormula(codes), ta = $('#sheetFormula');
+    ta.value = f;
+    let ok = false;
+    try { await navigator.clipboard.writeText(f); ok = true; } catch (e) { ok = false; }
+    if (!ok) { ta.hidden = false; ta.focus(); ta.select(); try { ok = document.execCommand('copy'); } catch (e) { ok = false; } }
+    const msg = ok ? `Formula copied for ${codes.length} ASX tickers. In your sheet, tap cell A1, paste, then tap ✓.` : 'Couldn\u2019t copy automatically: select the formula below, copy it, and paste it into cell A1.';
+    if (!ok) ta.hidden = false;
+    if (view === 'settings') { $('#sheetMsg').className = 'small muted'; $('#sheetMsg').textContent = msg; } else banner(msg, ok ? 'info' : 'error', 8000);
+    window.__app.lastFormula = f;
+    return ok;
+  }
+  $('#sheetCopy').onclick = e => copyFormula(e.currentTarget);
+  $('#sheetSave').onclick = async () => {
+    const raw = $('#sheetUrl').value.trim(), msg = $('#sheetMsg'), say = (t, err) => { msg.className = 'small ' + (err ? 'err-t' : 'muted'); msg.textContent = t; };
+    if (!raw) { say('Paste your Google Sheet link first (Share → Copy link in Google Sheets).', true); return; }
+    try { L.normalizeSheetUrl(raw); } catch (e) { say(e.message, true); return; }
+    say('Testing the link…'); $('#sheetSave').disabled = true;
+    try {
+      const r = await A.fetchSheet(plainFetch, raw);
+      settings.asxSheetUrl = raw; asxErr = ''; saveSettings(); makeSource(); renderSheet(); renderUsage();
+      const codes = asxCodes(), found = Object.keys(r.quotes), missing = codes.filter(c => !found.includes(c) && !r.skipped.includes(c));
+      let t = found.length ? `Saved. Found ${found.length} ASX price${found.length === 1 ? '' : 's'} (${found.slice(0, 5).join(', ')}${found.length > 5 ? '…' : ''}).` : 'Saved, but the sheet has no prices yet. Paste the formula into cell A1 and wait a few seconds.';
+      if (r.skipped.length) t += ` No price yet for ${r.skipped.join(', ')}: Google Finance may still be loading, or doesn\u2019t know that code.`;
+      if (missing.length && found.length) t += ` Not in the sheet: ${missing.join(', ')}. Tap Copy formula and paste it over A1 to add them.`;
+      say(t, !found.length);
+    } catch (e) { say(e.message + ' The link wasn\u2019t saved.', true); }
+    finally { $('#sheetSave').disabled = false; }
+  };
+  $('#sheetRemove').onclick = () => {
+    if (!confirm('Remove the Google Sheet link? ASX prices will stop updating.')) return;
+    settings.asxSheetUrl = ''; saveSettings(); makeSource(); renderSheet(); renderUsage(); $('#sheetMsg').textContent = 'Link removed.';
+  };
+  $('#setupAsx').onclick = () => { go('#/settings'); setTimeout(() => { $('#sheetHow').open = true; $('#asxCard').scrollIntoView({ block: 'start' }); }, 50); };
+
+  /* ---------- backup + restore ---------- */
+  let pendingRestore = null;
+  const dayWord = n => (n === 0 ? 'today' : n === 1 ? 'yesterday' : n + ' days ago');
+  function renderBackup() {
+    const m = L.loadBackupMeta(store), r = L.backupReminder(m);
+    $('#backupLast').innerHTML = (m.lastAt ? `Last backup: <b>${esc(L.fmtAsOf(m.lastAt))}</b> (${dayWord(r.daysSince)})` : 'No backup made on this device yet.') +
+      (r.due ? ` <span class="warn-t" id="backupDue">${m.lastAt ? 'It\u2019s been a while: worth backing up again.' : 'Worth making one now.'}</span>` : '');
+    $('#backupKeys').checked = !!settings.includeKeysInBackup;
+  }
+  function renderNudge() {
+    const el = $('#backupNudge'), r = L.backupReminder(L.loadBackupMeta(store));
+    el.hidden = !(r.due && view === 'list');
+    if (el.hidden) return;
+    el.innerHTML = `<p>${r.never ? 'No backup yet' : 'Last backup ' + r.daysSince + ' days ago'}. A quick backup keeps your watchlists, portfolio and alerts safe if iOS clears the app\u2019s data.</p>` +
+      '<div class="row"><button type="button" class="primary sm grow" id="nudgeBackup">Back up now</button><button type="button" class="ghost sm" id="nudgeLater">Later</button></div>';
+  }
+  $('#backupNudge').addEventListener('click', e => {
+    if (e.target.closest('#nudgeBackup')) backupNow().then(renderNudge);
+    if (e.target.closest('#nudgeLater')) { const m = L.loadBackupMeta(store); m.snoozeUntil = Date.now() + 3 * L.DAY; L.saveBackupMeta(store, m); renderNudge(); }
+  });
+  function backupSay(t, err) { const el = $('#backupMsg'); el.className = 'small ' + (err ? 'err-t' : 'muted'); el.textContent = t; if (view !== 'settings') banner(t, err ? 'error' : 'info', 6000); }
+  async function backupNow() {
+    const obj = L.buildBackup(store, { includeKeys: !!settings.includeKeysInBackup, current: { US: wls.US, ASX: wls.ASX, portfolio: pf, alerts } }), name = L.backupFileName(), txt = JSON.stringify(obj, null, 2);
+    const file = new File([txt], name, { type: 'application/json' });
+    let how = 'download';
+    if (navigator.share && navigator.canShare) {
+      let can = false; try { can = navigator.canShare({ files: [file] }); } catch (e) { can = false; }
+      if (can) {
+        try { await navigator.share({ files: [file], title: name }); how = 'share'; }
+        catch (e) { if (e && e.name === 'AbortError') { backupSay('Backup cancelled, nothing was saved.'); return false; } how = 'download'; }
+      }
+    }
+    if (how === 'download') {
+      const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = name; a.rel = 'noopener'; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    }
+    const m = L.loadBackupMeta(store); m.lastAt = Date.now(); m.snoozeUntil = 0; L.saveBackupMeta(store, m);
+    window.__app.lastBackup = { name, how, bytes: txt.length, includesKeys: obj.includesKeys };
+    backupSay(how === 'share' ? `Backup ready: ${name}. Choose Save to Files to keep it in iCloud Drive.` : `Backup downloaded: ${name}${obj.includesKeys ? ' (includes API keys: keep it private)' : ''}.`);
+    if (view === 'settings') renderBackup();
+    return true;
+  }
+  $('#backupNow').onclick = () => backupNow();
+  $('#backupKeys').addEventListener('change', e => { settings.includeKeysInBackup = e.target.checked; saveSettings(); });
+  $('#restoreBtn').onclick = () => $('#restoreFile').click();
+  $('#restoreFile').addEventListener('change', async e => {
+    const f = e.target.files && e.target.files[0]; e.target.value = '';
+    if (!f) return;
+    $('#restorePreview').hidden = true; pendingRestore = null;
+    let parsed;
+    try { parsed = L.parseBackup(await f.text()); } catch (err) { backupSay('Can\u2019t restore: ' + err.message, true); return; }
+    pendingRestore = parsed; renderRestorePreview(parsed, f.name); backupSay('');
+  });
+  function renderRestorePreview(p, fname) {
+    const now = L.currentSummary(store, { US: wls.US, ASX: wls.ASX }), b = p.summary, d = p.data;
+    const row = (label, cur, next, keep) => `<tr><td>${label}</td><td>${cur}</td><td>${keep ? '<span class="muted">kept</span>' : next}</td></tr>`;
+    const set = v => (v ? 'set' : 'not set');
+    $('#restorePreview').innerHTML = `<h3>Restore “${esc(fname)}”?</h3><p>Backup made ${p.createdAt ? esc(L.fmtAsOf(p.createdAt)) : '(date unknown)'}. What\u2019s on this device and in the file:</p>` +
+      '<table id="restoreTable"><tr><th></th><th>Now</th><th>From backup</th></tr>' +
+      row('US watchlist', now.us + ' tickers', b.us + ' tickers', !d.watchlists.US) + row('ASX watchlist', now.asx + ' tickers', b.asx + ' tickers', !d.watchlists.ASX) +
+      row('Favourites', now.favourites, b.favourites) + row('Portfolio', now.holdings + ' holdings (' + now.holdingsWithUnits + ' with units)', b.holdings + ' holdings (' + b.holdingsWithUnits + ' with units)', !d.portfolio) +
+      row('Alerts', now.alertRules + ' rules, ' + now.alertHistory + ' fired', b.alertRules + ' rules, ' + b.alertHistory + ' fired', !d.alerts) +
+      row('Google Sheet link', set(now.sheet), set(b.sheet)) + row('API keys', now.keys + ' set', b.keys + ' in file', !p.includesKeys) + '</table>' +
+      `<p class="muted"><b>Merge</b> keeps everything on this device and adds what\u2019s only in the backup (tickers, favourites, holdings, alert rules; a 0-unit holding is filled in from the backup). <b>Replace</b> makes this device match the backup. ${p.includesKeys ? 'The file includes API keys: Replace uses them, Merge only fills empty ones.' : 'The file has no API keys, so your current keys stay as they are.'} Cached prices are kept. Neither can be undone, so back up first if unsure.</p>` +
+      '<div class="row"><button type="button" class="primary grow" id="restoreMerge">Merge</button><button type="button" class="danger grow" id="restoreGo">Replace</button><button type="button" class="ghost" id="restoreCancel">Cancel</button></div>';
+    $('#restorePreview').hidden = false;
+    $('#restorePreview').scrollIntoView({ block: 'center' });
+  }
+  $('#restorePreview').addEventListener('click', e => {
+    if (e.target.closest('#restoreCancel')) { pendingRestore = null; $('#restorePreview').hidden = true; backupSay('Restore cancelled. Nothing changed.'); return; }
+    const mode = e.target.closest('#restoreMerge') ? 'merge' : e.target.closest('#restoreGo') ? 'replace' : '';
+    if (mode && pendingRestore) {
+      if (!confirm(mode === 'merge' ? 'Add what\u2019s in this backup to your watchlists, portfolio and alerts? Nothing on this device is removed.' : 'Replace your watchlists, portfolio, alerts and settings with this backup?')) return;
+      L.applyBackup(store, pendingRestore, { mode, current: { US: wls.US, ASX: wls.ASX, portfolio: pf, alerts } }); pendingRestore = null;
+      sessionStorage.setItem('sw.restored', mode);
+      location.reload();
+    }
+  });
+
   /* ---------- boot ---------- */
   // The three portfolio ETFs start starred and pinned to the top of the ASX list.
   function asxDefaults(w) { w.favourites = L.SEED_PORTFOLIO.map(h => h.symbol).filter(s => w.symbols.some(x => x.symbol === s)); w.favouritesFirst = true; return w; }
@@ -685,8 +869,10 @@
     if (!store.getItem(WL_KEY.ASX)) asxDefaults(wls.ASX);
     pf = L.loadPortfolio(store); alerts = L.loadAlerts(store);
     if (!store.getItem(L.KEYS.portfolio)) savePf(); // seed: tickers only (units 0, cost blank)
-    updateBadge();
+    updateBadge(); L.loadBackupMeta(store); // records first use, so the backup reminder starts counting from today
     makeSource(); startRefresh(); route();
+    const restored = sessionStorage.getItem('sw.restored');
+    if (restored) { sessionStorage.removeItem('sw.restored'); banner((restored === 'merge' ? 'Merged the backup into this device.' : 'Restored from backup.') + (src ? '' : ' Add your API keys or Google Sheet link in Settings.'), 'info', 8000); }
     if (src) { refreshAlertQuotes(); setTimeout(checkAlerts, 1500); } // check on app open
     if ('serviceWorker' in navigator && location.protocol !== 'file:') {
       const hadCtrl = !!navigator.serviceWorker.controller; let reloaded = false;
@@ -697,6 +883,6 @@
       }).catch(() => {});
     }
   }
-  window.__app = { get src() { return src; }, get wl() { return wls.US; }, get wls() { return wls; }, get pf() { return pf; }, get alerts() { return alerts; }, chart, checkAlerts, notifyCount: 0 };
+  window.__app = { backupNow, get settings() { return settings; }, get src() { return src; }, get wl() { return wls.US; }, get wls() { return wls; }, get pf() { return pf; }, get alerts() { return alerts; }, chart, checkAlerts, notifyCount: 0 };
   boot();
 })();

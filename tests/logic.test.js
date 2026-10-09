@@ -327,5 +327,161 @@ const defaults = require('../data/default-watchlist.json');
     assert.strictEqual(L.classifyError('marketstack', 403, { error: { code: 105, type: 'function_access_restricted', info: 'Access Restricted' } }).type, 'premium');
     assert.strictEqual(L.classifyError('marketstack', 422, { error: { code: 'no_valid_symbols_provided', message: 'x' } }).type, 'not-found');
   });
+  await test('Google Sheet link: published and shared links become CSV URLs; anything else is rejected', () => {
+    const pub = L.normalizeSheetUrl('https://docs.google.com/spreadsheets/d/e/2PACX-FAKE_PUBLISHED_SHEET_ID_FOR_TESTS/pubhtml?gid=42&single=true');
+    assert.deepStrictEqual(pub, { url: 'https://docs.google.com/spreadsheets/d/e/2PACX-FAKE_PUBLISHED_SHEET_ID_FOR_TESTS/pub?gid=42&single=true&output=csv', kind: 'published' });
+    assert.strictEqual(L.normalizeSheetUrl(' https://docs.google.com/spreadsheets/d/e/2PACX-FAKE_PUBLISHED_SHEET_ID_FOR_TESTS/pub?output=csv ').url, 'https://docs.google.com/spreadsheets/d/e/2PACX-FAKE_PUBLISHED_SHEET_ID_FOR_TESTS/pub?output=csv');
+    assert.deepStrictEqual(L.normalizeSheetUrl('https://docs.google.com/spreadsheets/d/FAKE_SHARED_SHEET_ID_FOR_TESTS_0001/edit?usp=sharing#gid=7'),
+      { url: 'https://docs.google.com/spreadsheets/d/FAKE_SHARED_SHEET_ID_FOR_TESTS_0001/gviz/tq?tqx=out:csv&headers=1&gid=7', kind: 'shared' });
+    assert.strictEqual(L.normalizeSheetUrl(''), null);
+    for (const bad of ['not a link', 'http://docs.google.com/spreadsheets/d/FAKE_SHARED_SHEET_ID_FOR_TESTS_0001/edit', 'https://evil.example/spreadsheets/d/FAKE_SHARED_SHEET_ID_FOR_TESTS_0001/', 'https://docs.google.com/document/d/FAKE_SHARED_SHEET_ID_FOR_TESTS_0001/edit', 'https://docs.google.com/spreadsheets/d/short/edit'])
+      assert.throws(() => L.normalizeSheetUrl(bad), Error, bad);
+  });
+  await test('CSV parser: quotes, escaped quotes, commas inside quotes, CRLF, BOM, blank lines', () => {
+    assert.deepStrictEqual(L.parseCsv('\uFEFFa,"b,c","say ""hi"""\r\n\r\n1,2,3\n'), [['a', 'b,c', 'say "hi"'], ['1', '2', '3']]);
+    assert.deepStrictEqual(L.parseCsv('x'), [['x']]); assert.deepStrictEqual(L.parseCsv(''), []);
+  });
+  await test('sheet numbers: A$, $, thousands separators; #N/A and Loading… are blank', () => {
+    assert.strictEqual(L.sheetNum('A$38.61'), 38.61); assert.strictEqual(L.sheetNum('$1,074.50'), 1074.5); assert.strictEqual(L.sheetNum(' 12 '), 12); assert.strictEqual(L.sheetNum('-0.5'), -0.5);
+    for (const v of ['#N/A', 'Loading...', '', null, 'abc', '1.2.3']) assert.strictEqual(L.sheetNum(v), null, String(v));
+  });
+  await test('parseSheetQuotes: header-driven columns, change vs previous close, Sydney trade time, skips blanks', () => {
+    const r = L.parseSheetQuotes(mocks.sheetCsv(['FANG', 'SEMI', 'IVV'], ['SEMI']));
+    assert.deepStrictEqual(Object.keys(r.quotes), ['FANG', 'IVV']); assert.deepStrictEqual(r.skipped, ['SEMI']);
+    const q = r.quotes.FANG, p = mocks.sheetPrice('FANG');
+    assert.strictEqual(q.price, p.price); assert.strictEqual(q.prevClose, p.prev); assert.ok(Math.abs(q.change - (p.price - p.prev)) < 1e-9);
+    assert.strictEqual(q.date, '2026-10-08'); assert.strictEqual(q.timeText, '2026-10-08 15:20'); assert.strictEqual(q.t, Date.UTC(2026, 9, 8, 4, 20)); assert.ok(q.sheet && !q.eod);
+    const cols = L.parseSheetQuotes('Ticker,Last,Prev,As of\nASX:BHP,45.10,44.00,2026-07-08 10:05\nbad row!,1,1,');
+    assert.strictEqual(cols.quotes.BHP.price, 45.1); assert.strictEqual(cols.quotes.BHP.t, Date.UTC(2026, 6, 8, 0, 5), 'winter: AEST is UTC+10');
+    const noHeader = L.parseSheetQuotes('FANG,38.5,38\nSEMI,40,');
+    assert.strictEqual(noHeader.quotes.FANG.price, 38.5); assert.strictEqual(noHeader.quotes.SEMI.change, null, 'no previous close -> no change');
+    assert.throws(() => L.parseSheetQuotes(''), /empty/); assert.throws(() => L.parseSheetQuotes('Symbol,Foo\nFANG,1'), /Price column/);
+  });
+  await test('sheetFormula: one A1 formula, header row + one row per unique valid ticker, GOOGLEFINANCE on ASX', () => {
+    const f = L.sheetFormula(['FANG', 'fang', 'SEMI', 'IVV', 'bad code!']);
+    assert.ok(f.startsWith('={"Symbol","Price","PrevClose","TradeTime";"FANG",IFERROR(GOOGLEFINANCE("ASX:FANG","price"),"")'));
+    assert.strictEqual((f.match(/GOOGLEFINANCE\("ASX:FANG"/g) || []).length, 3); assert.ok(f.includes('GOOGLEFINANCE("ASX:IVV","closeyest")') && f.includes('"yyyy-mm-dd hh:mm"'));
+    assert.strictEqual(f.split(';').length, 4, 'header + 3 tickers'); assert.ok(f.endsWith('}'));
+    const r = L.parseSheetQuotes('Symbol,Price,PrevClose,TradeTime\nFANG,38,37,'); assert.strictEqual(r.rows, 1, 'the formula\u2019s own header is what the parser expects');
+  });
+  await test('backup: has watchlists, favourites, portfolio, alerts, settings; API keys only when asked', () => {
+    const st = memStorage();
+    const us = L.defaultWatchlist(defaults.symbols.slice(0, 5)); L.toggleFavourite(us, 'NVDA'); L.saveWatchlist(st, us);
+    const asx = L.defaultWatchlist([{ symbol: 'FANG' }, { symbol: 'SEMI' }, { symbol: 'IVV' }]); L.toggleFavourite(asx, 'FANG'); L.saveWatchlist(st, asx, L.KEYS.watchlistAsx);
+    const pf = L.defaultPortfolio(); L.updateHolding(pf, 'ASX:FANG', { units: 10, avgCost: 20 }); L.savePortfolio(st, pf);
+    const al = L.emptyAlerts(); L.addAlertRule(al, { sym: 'ASX:IVV', type: 'below', value: 50 }); L.saveAlerts(st, al);
+    st.setItem(L.KEYS.settings, JSON.stringify({ refreshSec: 300, market: 'ASX', asxSheetUrl: 'https://docs.google.com/spreadsheets/d/FAKE_SHARED_SHEET_ID_FOR_TESTS_0001/edit', junk: '<script>' }));
+    st.setItem(L.KEYS.apiKeys, JSON.stringify({ finnhub: 'FAKE_FINNHUB_KEY_FOR_TESTS', twelvedata: '', marketstack: 'FAKE_MARKETSTACK_KEY_FOR_TESTS' }));
+    st.setItem(L.CACHE_PREFIX + 'q:AAPL', JSON.stringify({ v: { price: 1 }, t: 0, ttl: 1 }));
+    const b = L.buildBackup(st, { now: Date.UTC(2026, 9, 8) });
+    assert.strictEqual(b.app, 'stock-watchlist'); assert.strictEqual(b.kind, 'backup'); assert.strictEqual(b.version, 1); assert.strictEqual(b.createdAt, '2026-10-08T00:00:00.000Z');
+    const txt = JSON.stringify(b);
+    assert.ok(!txt.includes('FAKE_FINNHUB') && !txt.includes('FAKE_MARKETSTACK') && !('keys' in b.data) && b.includesKeys === false, 'no keys by default');
+    assert.ok(!txt.includes('q:AAPL') && !txt.includes('junk'), 'no cached prices, unknown settings dropped');
+    assert.deepStrictEqual(b.data.watchlists.ASX.favourites, ['FANG']); assert.strictEqual(b.data.portfolio.holdings.find(h => h.symbol === 'FANG').units, 10);
+    assert.strictEqual(b.data.settings.asxSheetUrl.includes('FAKE_SHARED'), true);
+    const withKeys = L.buildBackup(st, { includeKeys: true });
+    assert.ok(withKeys.includesKeys && withKeys.data.keys.finnhub === 'FAKE_FINNHUB_KEY_FOR_TESTS');
+    assert.ok(/^stock-watchlist-backup-\d{4}-\d{2}-\d{2}\.json$/.test(L.backupFileName()));
+    // an untouched default list isn't in storage yet: the in-memory one is backed up instead
+    const st2 = memStorage(); L.saveWatchlist(st2, asx, L.KEYS.watchlistAsx);
+    assert.strictEqual(L.buildBackup(st2).data.watchlists.US, null);
+    const memUs = L.defaultWatchlist([{ symbol: 'AAPL' }, { symbol: 'MSFT' }]);
+    const withMem = L.buildBackup(st2, { current: { US: memUs, ASX: L.defaultWatchlist([{ symbol: 'BHP' }]), portfolio: pf } });
+    assert.deepStrictEqual(withMem.data.watchlists.US.symbols.map(x => x.symbol), ['AAPL', 'MSFT']);
+    assert.strictEqual(withMem.data.portfolio.holdings.find(h => h.symbol === 'FANG').units, 10);
+    assert.deepStrictEqual(withMem.data.watchlists.ASX.favourites, ['FANG'], 'what is saved wins over memory');
+    assert.strictEqual(L.currentSummary(st2).us, 0); assert.strictEqual(L.currentSummary(st2, { US: memUs }).us, 2, 'preview counts the list on screen when it is not saved yet');
+  });
+  await test('restore: validates, previews counts, replaces data; keys kept unless the file has them', () => {
+    const st = memStorage();
+    L.saveWatchlist(st, L.defaultWatchlist(defaults.symbols.slice(0, 3)));
+    st.setItem(L.KEYS.apiKeys, JSON.stringify({ finnhub: 'FAKE_FINNHUB_KEY_FOR_TESTS', twelvedata: '', marketstack: '' }));
+    const src = memStorage();
+    const us = L.defaultWatchlist(defaults.symbols.slice(0, 8)); L.toggleFavourite(us, us.symbols[0].symbol); L.saveWatchlist(src, us);
+    L.saveWatchlist(src, L.defaultWatchlist([{ symbol: 'FANG' }, { symbol: 'BHP' }]), L.KEYS.watchlistAsx);
+    const pf = L.defaultPortfolio(); L.updateHolding(pf, 'ASX:SEMI', { units: 5, avgCost: 11 }); L.savePortfolio(src, pf);
+    src.setItem(L.KEYS.settings, JSON.stringify({ refreshSec: 60 }));
+    const p = L.parseBackup(JSON.stringify(L.buildBackup(src)));
+    assert.deepStrictEqual([p.summary.us, p.summary.asx, p.summary.favourites, p.summary.holdings, p.summary.holdingsWithUnits, p.summary.keys], [8, 2, 1, 3, 1, 0]);
+    assert.strictEqual(L.currentSummary(st).us, 3);
+    L.applyBackup(st, p);
+    assert.strictEqual(L.loadWatchlist(st, [], L.KEYS.watchlist).symbols.length, 8); assert.strictEqual(L.loadPortfolio(st).holdings.find(h => h.symbol === 'SEMI').units, 5);
+    assert.strictEqual(JSON.parse(st.getItem(L.KEYS.settings)).refreshSec, 60);
+    assert.strictEqual(JSON.parse(st.getItem(L.KEYS.apiKeys)).finnhub, 'FAKE_FINNHUB_KEY_FOR_TESTS', 'keys untouched by a key-less backup');
+    src.setItem(L.KEYS.apiKeys, JSON.stringify({ finnhub: 'FAKE_OTHER_KEY_FOR_TESTS' }));
+    L.applyBackup(st, L.parseBackup(JSON.stringify(L.buildBackup(src, { includeKeys: true }))));
+    assert.strictEqual(JSON.parse(st.getItem(L.KEYS.apiKeys)).finnhub, 'FAKE_OTHER_KEY_FOR_TESTS', 'keys restored when included');
+  });
+  await test('restore rejects bad files with a plain reason, and cleans what it accepts', () => {
+    const good = L.buildBackup(memStorage());
+    const bad = [['not json', /valid JSON/], ['[]', /isn\u2019t a Stock Watchlist backup/], [JSON.stringify({ app: 'gym-tracker', data: {} }), /Gym Tracker backup/],
+      [JSON.stringify({ ...good, version: 99 }), /newer version/], [JSON.stringify({ ...good, version: 'x' }), /version/], [JSON.stringify({ ...good, data: {} }), /missing its watchlists/],
+      [JSON.stringify({ ...good, data: { watchlists: { US: null, ASX: null } } }), /no watchlist data/],
+      [JSON.stringify({ ...good, data: { watchlists: { US: { symbols: [] } }, portfolio: { holdings: 'x' } } }), /portfolio is damaged/],
+      [JSON.stringify({ ...good, data: { watchlists: { US: { symbols: [] } }, alerts: { rules: 5 } } }), /alerts are damaged/]];
+    for (const [t, re] of bad) assert.throws(() => L.parseBackup(t), re, t.slice(0, 40));
+    const dirty = { app: 'stock-watchlist', kind: 'backup', version: 1, createdAt: 'nope', includesKeys: false,
+      data: { watchlists: { US: { symbols: [{ symbol: 'aapl', name: 'Apple' }, { symbol: '<img>' }, { symbol: 'AAPL' }], favourites: ['AAPL', 'ZZZ'] } },
+        portfolio: { holdings: [{ symbol: 'FANG', exchange: 'ASX', units: -5 }, { symbol: 'IVV', exchange: 'ASX', units: 3, avgCost: 60 }] }, settings: { refreshSec: 7, asxSheetUrl: 'https://evil.example/x' },
+        keys: { finnhub: 'FAKE_SNEAKY_KEY_FOR_TESTS' } } };
+    const p = L.parseBackup(JSON.stringify(dirty));
+    assert.deepStrictEqual(p.data.watchlists.US.symbols, [{ symbol: 'AAPL', name: 'Apple' }]); assert.deepStrictEqual(p.data.watchlists.US.favourites, ['AAPL']);
+    assert.deepStrictEqual(p.data.portfolio.holdings.map(h => h.symbol), ['IVV'], 'invalid holding dropped'); assert.deepStrictEqual(p.data.settings, {}, 'bad settings dropped');
+    assert.strictEqual(p.data.watchlists.ASX, null, 'missing ASX list is left alone on restore'); assert.strictEqual(p.createdAt, null);
+    assert.ok(!p.includesKeys && !p.data.keys, 'keys ignored when the file says it has none');
+  });
+  await test('backup reminder: due 14 days after the last backup (or first use), snooze works', () => {
+    const st = memStorage(), t0 = Date.UTC(2026, 9, 1);
+    const m = L.loadBackupMeta(st, t0); assert.strictEqual(m.firstSeenAt, t0); assert.strictEqual(L.loadBackupMeta(st, t0 + L.DAY).firstSeenAt, t0, 'first use is remembered');
+    assert.deepStrictEqual(L.backupReminder(m, t0 + 13 * L.DAY), { due: false, daysSince: 13, never: true });
+    assert.strictEqual(L.backupReminder(m, t0 + 14 * L.DAY).due, true);
+    m.lastAt = t0 + 10 * L.DAY; assert.strictEqual(L.backupReminder(m, t0 + 20 * L.DAY).due, false); assert.strictEqual(L.backupReminder(m, t0 + 24 * L.DAY).due, true);
+    m.snoozeUntil = t0 + 26 * L.DAY; assert.strictEqual(L.backupReminder(m, t0 + 25 * L.DAY).due, false); assert.strictEqual(L.backupReminder(m, t0 + 26 * L.DAY).due, true);
+  });
+  await test('restore merge: keeps this device\'s data, adds what is only in the backup, fills placeholders and gaps', () => {
+    const st = memStorage(), src = memStorage();
+    const us = L.defaultWatchlist([{ symbol: 'AAPL' }, { symbol: 'MSFT' }]); L.toggleFavourite(us, 'AAPL'); L.saveWatchlist(st, us);
+    const pf = L.defaultPortfolio(); L.updateHolding(pf, 'ASX:IVV', { units: 4, avgCost: 60 }); L.savePortfolio(st, pf); // FANG, SEMI still 0-unit placeholders
+    const al = L.emptyAlerts(); L.addAlertRule(al, { sym: 'ASX:IVV', type: 'below', value: 50 }); L.saveAlerts(st, al);
+    st.setItem(L.KEYS.apiKeys, JSON.stringify({ finnhub: 'FAKE_FINNHUB_KEY_FOR_TESTS', twelvedata: '', marketstack: '' }));
+    const bus = L.defaultWatchlist([{ symbol: 'MSFT' }, { symbol: 'NVDA' }]); L.toggleFavourite(bus, 'NVDA'); L.saveWatchlist(src, bus);
+    const bpf = L.defaultPortfolio(); L.updateHolding(bpf, 'ASX:IVV', { units: 99, avgCost: 1 }); L.updateHolding(bpf, 'ASX:FANG', { units: 7, avgCost: 20 }); L.addHolding(bpf, { symbol: 'BHP', exchange: 'ASX', units: 2 }); L.savePortfolio(src, bpf);
+    const bal = L.emptyAlerts(); L.addAlertRule(bal, { sym: 'ASX:IVV', type: 'below', value: 50 }); L.addAlertRule(bal, { sym: 'ASX:FANG', type: 'above', value: 40 }); L.saveAlerts(src, bal);
+    src.setItem(L.KEYS.settings, JSON.stringify({ refreshSec: 60, asxSheetUrl: 'https://docs.google.com/spreadsheets/d/FAKE_SHARED_SHEET_ID_FOR_TESTS_0001/edit' }));
+    src.setItem(L.KEYS.apiKeys, JSON.stringify({ finnhub: 'FAKE_OTHER_KEY_FOR_TESTS', twelvedata: 'FAKE_TWELVE_KEY_FOR_TESTS', marketstack: '' }));
+    st.setItem(L.KEYS.settings, JSON.stringify({ refreshSec: 300 }));
+    L.applyBackup(st, L.parseBackup(JSON.stringify(L.buildBackup(src, { includeKeys: true }))), { mode: 'merge' });
+    const w = L.loadWatchlist(st, [], L.KEYS.watchlist);
+    assert.deepStrictEqual(w.symbols.map(x => x.symbol), ['AAPL', 'MSFT', 'NVDA'], 'device order first, new tickers appended, no duplicates');
+    assert.deepStrictEqual(w.favourites, ['AAPL', 'NVDA']);
+    const p = L.loadPortfolio(st), u = s => p.holdings.find(h => h.symbol === s).units;
+    assert.strictEqual(u('IVV'), 4, 'device holding with units wins'); assert.strictEqual(u('FANG'), 7, '0-unit placeholder filled from backup'); assert.strictEqual(u('BHP'), 2, 'new holding added'); assert.strictEqual(u('SEMI'), 0);
+    const a = L.loadAlerts(st); assert.strictEqual(a.rules.length, 2, 'same rule (ticker, type, value) not duplicated');
+    const s = JSON.parse(st.getItem(L.KEYS.settings)); assert.strictEqual(s.refreshSec, 300, 'device settings kept'); assert.ok(s.asxSheetUrl.includes('FAKE_SHARED'), 'missing sheet link filled');
+    const k = JSON.parse(st.getItem(L.KEYS.apiKeys)); assert.strictEqual(k.finnhub, 'FAKE_FINNHUB_KEY_FOR_TESTS', 'existing key kept'); assert.strictEqual(k.twelvedata, 'FAKE_TWELVE_KEY_FOR_TESTS', 'empty key filled');
+    // merge onto a device whose US list is the untouched default (only in memory)
+    const st2 = memStorage(), mem = L.defaultWatchlist([{ symbol: 'GOOGL' }]);
+    L.applyBackup(st2, L.parseBackup(JSON.stringify(L.buildBackup(src))), { mode: 'merge', current: { US: mem } });
+    assert.deepStrictEqual(L.loadWatchlist(st2, [], L.KEYS.watchlist).symbols.map(x => x.symbol), ['GOOGL', 'MSFT', 'NVDA']);
+    assert.strictEqual(st2.getItem(L.KEYS.apiKeys), null, 'no keys in file: keys untouched');
+  });
+  await test('hand-typed sheet from the iPhone guide (Symbol, Price only) values FANG, SEMI, IVV in AUD with gain/loss', () => {
+    const G = L.SHEET_GUIDE, cells = {};
+    for (const line of G.byHand.slice(1, -1)) { const m = /^([AB])(\d): (.+)$/.exec(line); cells[m[1] + m[2]] = m[3]; }
+    // what Google would export for that sheet (formulas replaced by prices)
+    const csv = [1, 2, 3, 4].map(r => '"' + cells['A' + r] + '","' + (r === 1 ? cells.B1 : { FANG: '38.33', SEMI: '39.32', IVV: '74.22' }[cells['A' + r]]) + '"').join('\n');
+    assert.ok(/=GOOGLEFINANCE\("ASX:FANG","price"\)/.test(cells.B2));
+    const r = L.parseSheetQuotes(csv);
+    assert.deepStrictEqual(Object.keys(r.quotes).sort(), ['FANG', 'IVV', 'SEMI']);
+    const pf = L.defaultPortfolio();
+    L.updateHolding(pf, 'ASX:FANG', { units: 100, avgCost: 30 }); L.updateHolding(pf, 'ASX:SEMI', { units: 50, avgCost: 35 }); L.updateHolding(pf, 'ASX:IVV', { units: 20, avgCost: 60 });
+    const sum = L.portfolioSummary(pf.holdings, id => r.quotes[id.replace('ASX:', '')], null); // ASX needs no FX rate
+    const row = s => sum.rows.find(x => x.symbol === s);
+    assert.strictEqual(row('FANG').currency, 'AUD'); assert.ok(Math.abs(row('FANG').value - 3833) < 1e-6); assert.ok(Math.abs(row('FANG').gain - 833) < 1e-6);
+    assert.ok(Math.abs(row('SEMI').value - 1966) < 1e-6); assert.ok(Math.abs(row('IVV').gain - 284.4) < 1e-6);
+    assert.ok(Math.abs(sum.total.value - 7283.4) < 1e-6 && Math.abs(sum.total.gain - 1333.4) < 1e-6, 'total ' + sum.total.value);
+    assert.strictEqual(row('FANG').dayChange, null, 'no previous close column: today\'s change left blank, not guessed');
+  });
   summary('logic');
 })();

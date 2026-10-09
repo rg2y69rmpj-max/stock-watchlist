@@ -4,12 +4,12 @@
   const NA_FREE = 'n/a (not on free tier)';
   const NA_NONE = 'n/a (not reported)';
   const KEYS = { watchlist: 'stockwatch.watchlist.v1', watchlistAsx: 'stockwatch.watchlist.asx.v1', settings: 'stockwatch.settings.v1', apiKeys: 'stockwatch.keys.v1',
-    usage: 'stockwatch.usage.v1', usageMonth: 'stockwatch.usage.month.v1', portfolio: 'stockwatch.portfolio.v1', alerts: 'stockwatch.alerts.v1' };
+    usage: 'stockwatch.usage.v1', usageMonth: 'stockwatch.usage.month.v1', portfolio: 'stockwatch.portfolio.v1', alerts: 'stockwatch.alerts.v1', backup: 'stockwatch.backup.v1' };
   const CACHE_PREFIX = 'stockwatch.cache.';
   const MIN = 60e3, HOUR = 60 * MIN, DAY = 24 * HOUR;
   const TTL = { quote: MIN, profile: 7 * DAY, metrics: 12 * HOUR, recommendation: 12 * HOUR, earnings: 12 * HOUR, priceTarget: 12 * HOUR, spark: 12 * HOUR,
     i5: 5 * MIN, i30: 30 * MIN, d1y: 6 * HOUR, w5y: DAY,
-    news: 30 * MIN, earningsCal: 6 * HOUR, fxLive: 10 * MIN, fxDaily: 6 * HOUR };
+    news: 30 * MIN, earningsCal: 6 * HOUR, fxLive: 10 * MIN, fxDaily: 6 * HOUR, sheet: 5 * MIN };
 
   // Chart ranges -> which Twelve Data series to fetch (1M, 6M and 1Y share one daily series, so they cost one credit together).
   const DATASETS = {
@@ -480,10 +480,264 @@
     while ([0, 6].includes(new Date(target).getUTCDay())) target += DAY;
     return Math.min(4 * DAY, Math.max(HOUR, target - off - ms));
   }
+  /* ---------- ASX via your own Google Sheet (GOOGLEFINANCE, shared or published as CSV) ----------
+     No key, no card, CORS allowed by Google. Prices are Google Finance's (delayed up to ~20 min), so they are not end-of-day only. */
+  const SHEET_HEADER = ['Symbol', 'Price', 'PrevClose', 'TradeTime'];
+  // Accepts a "Publish to web" link (…/spreadsheets/d/e/2PACX…/pubhtml or pub?output=csv) or a normal share link (…/spreadsheets/d/<id>/edit…).
+  function normalizeSheetUrl(raw) {
+    const s = String(raw || '').trim();
+    if (!s) return null;
+    let u; try { u = new URL(s); } catch (e) { throw new Error('That isn\u2019t a link. Copy the whole link from Google Sheets (it starts with https://docs.google.com/spreadsheets/).'); }
+    if (u.protocol !== 'https:' || u.hostname !== 'docs.google.com' || !u.pathname.startsWith('/spreadsheets/d/')) throw new Error('Use a Google Sheets link that starts with https://docs.google.com/spreadsheets/');
+    const gid = u.searchParams.get('gid') || (/(?:^|[#&])gid=(\d+)/.exec(u.hash) || [])[1] || '';
+    if (gid && !/^\d+$/.test(gid)) throw new Error('The link has an odd gid (sheet tab) value.');
+    let m = /^\/spreadsheets\/d\/e\/([A-Za-z0-9_-]{20,})\//.exec(u.pathname + '/');
+    if (m) return { url: 'https://docs.google.com/spreadsheets/d/e/' + m[1] + '/pub?' + (gid ? 'gid=' + gid + '&single=true&' : '') + 'output=csv', kind: 'published' };
+    m = /^\/spreadsheets\/d\/([A-Za-z0-9_-]{20,})(\/|$)/.exec(u.pathname);
+    if (m) return { url: 'https://docs.google.com/spreadsheets/d/' + m[1] + '/gviz/tq?tqx=out:csv&headers=1' + (gid ? '&gid=' + gid : ''), kind: 'shared' };
+    throw new Error('Couldn\u2019t find the sheet id in that link.');
+  }
+  function parseCsv(text) {
+    const rows = []; let row = [], cell = '', q = false;
+    const s = String(text || '').replace(/^\uFEFF/, '');
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (q) { if (c === '"') { if (s[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c; continue; }
+      if (c === '"') q = true;
+      else if (c === ',') { row.push(cell); cell = ''; }
+      else if (c === '\n' || c === '\r') { if (c === '\r' && s[i + 1] === '\n') i++; row.push(cell); rows.push(row); row = []; cell = ''; }
+      else cell += c;
+    }
+    if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+    return rows.filter(r => r.some(x => String(x).trim() !== ''));
+  }
+  // "A$38.61", "38.61", "1,234.50" -> number; "#N/A", "Loading..." and blanks -> null.
+  function sheetNum(v) {
+    const t = String(v == null ? '' : v).trim();
+    if (!t || /^#|loading/i.test(t)) return null;
+    const c = t.replace(/[A-Z]{0,3}\$|AUD|\s|,/gi, '');
+    return /^-?\d+(\.\d+)?$/.test(c) ? Number(c) : null;
+  }
+  // Wall-clock time in Sydney -> UTC ms (handles daylight saving).
+  function sydneyToUtc(y, mo, d, h, mi) {
+    const guess = Date.UTC(y, mo - 1, d, h, mi) - 10 * HOUR;
+    for (let k = 0, t = guess; k < 2; k++) {
+      let off = 10 * HOUR;
+      try {
+        const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: 'Australia/Sydney', hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+          .formatToParts(new Date(t)).map(x => [x.type, x.value]));
+        off = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute) - t;
+      } catch (e) { /* no Intl time zones */ }
+      t = Date.UTC(y, mo - 1, d, h, mi) - off;
+      if (k === 1) return t;
+    }
+    return guess;
+  }
+  // CSV -> {quotes: {FANG: {price, prevClose, change, changePct, date, t, sheet: true}}, rows, skipped: [...]}
+  function parseSheetQuotes(text) {
+    const rows = parseCsv(text);
+    if (!rows.length) throw new Error('The sheet is empty. Paste the formula from the app into cell A1.');
+    if (/^\s*<(!doctype|html)/i.test(String(text))) throw new Error('Google sent a web page instead of CSV. Check the sheet is shared (Anyone with the link) or published to the web.');
+    const norm = h => String(h).toLowerCase().replace(/[^a-z]/g, '');
+    const hi = rows.findIndex(r => r.some(c => ['symbol', 'ticker', 'code', 'asxcode'].includes(norm(c))));
+    let col = { sym: 0, price: 1, prev: 2, time: 3 }, body = rows;
+    if (hi >= 0) {
+      const h = rows[hi].map(norm), find = names => h.findIndex(x => names.includes(x));
+      col = { sym: find(['symbol', 'ticker', 'code', 'asxcode']), price: find(['price', 'last', 'lastprice', 'close']), prev: find(['prevclose', 'closeyest', 'previousclose', 'prev']), time: find(['tradetime', 'time', 'datetime', 'date', 'asof']) };
+      body = rows.slice(hi + 1);
+      if (col.price < 0) throw new Error('The sheet has no Price column. Paste the formula from the app into cell A1.');
+    }
+    const quotes = {}, skipped = [];
+    for (const r of body) {
+      const code = normalizeAsx(r[col.sym]);
+      if (!code) continue;
+      const price = sheetNum(r[col.price]), prev = col.prev >= 0 ? sheetNum(r[col.prev]) : null;
+      if (price === null || price <= 0) { skipped.push(code); continue; }
+      const tt = col.time >= 0 ? String(r[col.time] || '').trim() : '';
+      const m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2}))?/.exec(tt);
+      const date = m ? m[1] + '-' + m[2] + '-' + m[3] : null;
+      const t = m ? sydneyToUtc(+m[1], +m[2], +m[3], m[4] ? +m[4] : 16, m[5] ? +m[5] : 0) : null;
+      quotes[code] = { price, prevClose: prev, change: prev ? price - prev : null, changePct: prev ? (price - prev) / prev * 100 : null, date, t, timeText: m && m[4] ? tt.slice(0, 16) : '', sheet: true, eod: false };
+    }
+    return { quotes, rows: Object.keys(quotes).length, skipped };
+  }
+  // One formula for cell A1 that builds the whole table (Australian/US/UK locale: commas between columns, semicolons between rows).
+  function sheetFormula(codes) {
+    const list = [...new Set((codes || []).map(normalizeAsx).filter(Boolean))];
+    const gf = (c, a) => `IFERROR(GOOGLEFINANCE("ASX:${c}","${a}"),"")`;
+    const row = c => `"${c}",${gf(c, 'price')},${gf(c, 'closeyest')},IFERROR(TEXT(GOOGLEFINANCE("ASX:${c}","tradetime"),"yyyy-mm-dd hh:mm"),"")`;
+    return '={' + SHEET_HEADER.map(h => '"' + h + '"').join(',') + (list.length ? ';' + list.map(row).join(';') : '') + '}';
+  }
+
+  // Plain-language iPhone guide, shown in Settings → ASX prices and copied word for word into the README (the hygiene test checks they match).
+  const SHEET_GUIDE = {
+    title: 'Set up free ASX prices on your iPhone (about 5 minutes, one time only)',
+    steps: [
+      'In this app, go to Settings (the ⚙ button) and find "ASX prices". Tap "Copy formula".',
+      'Open the Google Sheets app (free from the App Store) and sign in with your Google account.',
+      'Tap the + button, then "New spreadsheet".',
+      'Tap the top-left box (A1). Tap the long bar at the bottom of the screen, tap it again and choose "Paste". Then tap the tick (✓).',
+      'Wait a few seconds. A small table appears with FANG, SEMI, IVV and their prices in A$.',
+      'Tap the three dots (⋮) at the top right, then "Share & export", then "Manage access".',
+      'Under "General access", change "Restricted" to "Anyone with the link" and check it says "Viewer". Go back.',
+      'Tap "Copy link".',
+      'Come back to this app: Settings → ASX prices. Paste the link into the "Google Sheet link" box and tap "Save and test". It should say "Saved. Found … ASX prices".',
+      'Open Portfolio. Tap FANG, type how many units you own and the average price you paid per unit, and tap Save. Do the same for SEMI and IVV. You will now see the value and the gain or loss in A$.'
+    ],
+    byHand: [
+      'If pasting doesn\u2019t work, type it in yourself instead, one box at a time:',
+      'A1: Symbol',
+      'B1: Price',
+      'A2: FANG',
+      'B2: =GOOGLEFINANCE("ASX:FANG","price")',
+      'A3: SEMI',
+      'B3: =GOOGLEFINANCE("ASX:SEMI","price")',
+      'A4: IVV',
+      'B4: =GOOGLEFINANCE("ASX:IVV","price")',
+      'Then carry on from the "Share & export" step.'
+    ],
+    notes: [
+      'Prices come from Google Finance and can be up to about 20 minutes behind. That is fine for checking value at the end of the day.',
+      'The sheet only has ticker codes and prices in it. Your units and costs stay on your iPhone.',
+      'Anyone you give the sheet link to can see those prices, nothing else.'
+    ]
+  };
+
   // Calendar date in New York (US earnings dates are exchange-local), plus or minus whole days.
   function usDate(ms, addDays = 0) {
     const t = ms + addDays * DAY;
     try { return new Date(t).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }).slice(0, 10); } catch (e) { return new Date(t - 4 * HOUR).toISOString().slice(0, 10); }
+  }
+
+  /* ---------- backup + restore (one JSON file; API keys only if you tick "include keys") ---------- */
+  const BACKUP_APP = 'stock-watchlist', BACKUP_VERSION = 1, BACKUP_REMIND_DAYS = 14;
+  const readRaw = (storage, k) => { try { return JSON.parse(storage.getItem(k)); } catch (e) { return null; } };
+  function memStore(obj) { const m = new Map(Object.entries(obj || {})); return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)) }; }
+  function cleanSettings(raw) {
+    const s = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}, out = {};
+    if (typeof s.demo === 'boolean') out.demo = s.demo;
+    if ([0, 60, 120, 300].includes(s.refreshSec)) out.refreshSec = s.refreshSec;
+    if (RANGE_ORDER.includes(s.range)) out.range = s.range;
+    if (s.market === 'US' || s.market === 'ASX') out.market = s.market;
+    if (isNum(s.msCap) && s.msCap >= 0) out.msCap = Math.min(100000, Math.round(s.msCap));
+    if (typeof s.asxSheetUrl === 'string') { try { const n = normalizeSheetUrl(s.asxSheetUrl); out.asxSheetUrl = n ? s.asxSheetUrl.trim() : ''; } catch (e) { /* drop a bad link */ } }
+    if (typeof s.includeKeysInBackup === 'boolean') out.includeKeysInBackup = s.includeKeysInBackup;
+    return out;
+  }
+  function cleanKeys(raw) {
+    const k = raw && typeof raw === 'object' ? raw : {}, ok = v => typeof v === 'string' && v.length <= 200 ? v.trim() : '';
+    return { finnhub: ok(k.finnhub), twelvedata: ok(k.twelvedata), marketstack: ok(k.marketstack) };
+  }
+  // `current` (optional) is what the app holds in memory, used when something hasn't been saved yet (e.g. an untouched default list).
+  function buildBackup(storage, { includeKeys = false, now = Date.now(), current = {} } = {}) {
+    const pick = (key, mem) => { const v = readRaw(storage, key); return v != null ? v : mem != null ? JSON.parse(JSON.stringify(mem)) : null; };
+    const data = {
+      watchlists: { US: pick(KEYS.watchlist, current.US), ASX: pick(KEYS.watchlistAsx, current.ASX) },
+      portfolio: pick(KEYS.portfolio, current.portfolio), alerts: pick(KEYS.alerts, current.alerts), settings: cleanSettings(readRaw(storage, KEYS.settings))
+    };
+    if (includeKeys) data.keys = cleanKeys(readRaw(storage, KEYS.apiKeys));
+    return { app: BACKUP_APP, kind: 'backup', version: BACKUP_VERSION, createdAt: new Date(now).toISOString(), includesKeys: !!includeKeys, data };
+  }
+  const backupFileName = (now = Date.now()) => 'stock-watchlist-backup-' + isoDate(new Date(now)) + '.json';
+  function backupSummary(d) {
+    const wlN = w => (w && Array.isArray(w.symbols) ? w.symbols.length : 0), favN = w => (w && Array.isArray(w.favourites) ? w.favourites.length : 0);
+    return { us: wlN(d.watchlists.US), asx: wlN(d.watchlists.ASX), favourites: favN(d.watchlists.US) + favN(d.watchlists.ASX),
+      holdings: d.portfolio ? d.portfolio.holdings.length : 0, holdingsWithUnits: d.portfolio ? d.portfolio.holdings.filter(h => h.units > 0).length : 0,
+      alertRules: d.alerts ? d.alerts.rules.length : 0, alertHistory: d.alerts ? d.alerts.history.length : 0,
+      keys: d.keys ? ['finnhub', 'twelvedata', 'marketstack'].filter(k => d.keys[k]).length : 0, sheet: !!(d.settings && d.settings.asxSheetUrl) };
+  }
+  // What's on this device now, in the same shape (for the "this will replace" preview).
+  function currentSummary(storage, current = {}) {
+    const wlNow = (key, mem, norm) => (storage.getItem(key) == null && mem ? mem : loadWatchlist(storage, [], key, norm));
+    const d = { watchlists: { US: wlNow(KEYS.watchlist, current.US, normalizeSymbol), ASX: wlNow(KEYS.watchlistAsx, current.ASX, normalizeAsx) },
+      portfolio: loadPortfolio(storage), alerts: loadAlerts(storage), settings: cleanSettings(readRaw(storage, KEYS.settings)), keys: cleanKeys(readRaw(storage, KEYS.apiKeys)) };
+    return backupSummary(d);
+  }
+  // Validates a backup file's text. Returns {createdAt, includesKeys, data (cleaned), summary}; throws an Error with a plain message.
+  function parseBackup(text) {
+    if (String(text).length > 5e6) throw new Error('That file is too big to be a Stock Watchlist backup.');
+    let o; try { o = JSON.parse(text); } catch (e) { throw new Error('That file isn\u2019t valid JSON, so it can\u2019t be a backup.'); }
+    if (!o || typeof o !== 'object') throw new Error('That file isn\u2019t a Stock Watchlist backup.');
+    if (o.app !== BACKUP_APP || o.kind !== 'backup') throw new Error(o.app === 'gym-tracker' ? 'That\u2019s a Gym Tracker backup, not a Stock Watchlist one.' : 'That file isn\u2019t a Stock Watchlist backup.');
+    if (!Number.isInteger(o.version) || o.version < 1) throw new Error('The backup has no valid version number.');
+    if (o.version > BACKUP_VERSION) throw new Error('This backup was made by a newer version of the app. Update the app first (close and reopen it).');
+    const d = o.data;
+    if (!d || typeof d !== 'object' || !d.watchlists || typeof d.watchlists !== 'object') throw new Error('The backup is missing its watchlists.');
+    const has = { US: !!(d.watchlists.US && Array.isArray(d.watchlists.US.symbols)), ASX: !!(d.watchlists.ASX && Array.isArray(d.watchlists.ASX.symbols)) };
+    if (!has.US && !has.ASX) throw new Error('The backup has no watchlist data.');
+    if (d.portfolio != null && !Array.isArray(d.portfolio.holdings)) throw new Error('The backup\u2019s portfolio is damaged.');
+    if (d.alerts != null && !Array.isArray(d.alerts.rules)) throw new Error('The backup\u2019s alerts are damaged.');
+    const tmp = memStore({ [KEYS.watchlist]: JSON.stringify(d.watchlists.US || null), [KEYS.watchlistAsx]: JSON.stringify(d.watchlists.ASX || null),
+      [KEYS.portfolio]: JSON.stringify(d.portfolio || null), [KEYS.alerts]: JSON.stringify(d.alerts || null) });
+    const data = {
+      watchlists: { US: has.US ? loadWatchlist(tmp, [], KEYS.watchlist) : null, ASX: has.ASX ? loadWatchlist(tmp, [], KEYS.watchlistAsx, normalizeAsx) : null },
+      portfolio: d.portfolio ? loadPortfolio(tmp) : null, alerts: d.alerts ? loadAlerts(tmp) : null, settings: cleanSettings(d.settings)
+    };
+    if (o.includesKeys && d.keys) data.keys = cleanKeys(d.keys);
+    const createdAt = Date.parse(o.createdAt);
+    return { createdAt: isFinite(createdAt) ? createdAt : null, includesKeys: !!data.keys, data, summary: backupSummary(data) };
+  }
+  // Restore. Keys are only touched when the backup has them; cached prices are left alone.
+  // mode 'replace' (default): the backup's data replaces this device's. mode 'merge': nothing on this device is removed or overwritten;
+  // tickers, favourites, holdings and alert rules that are only in the backup are added, and a seeded placeholder holding
+  // (0 units, no cost) is filled in from the backup. Settings and keys only fill gaps (e.g. no Google Sheet link yet).
+  // `current` (optional): in-memory lists that aren't saved yet (an untouched default list), same as buildBackup.
+  function mergeWatchlist(cur, add) {
+    if (!add) return cur; if (!cur) return add;
+    const out = JSON.parse(JSON.stringify(cur)), have = new Set(out.symbols.map(x => x.symbol));
+    for (const x of add.symbols) if (!have.has(x.symbol)) { have.add(x.symbol); out.symbols.push({ symbol: x.symbol, name: x.name || '' }); }
+    for (const f of add.favourites || []) if (!out.favourites.includes(f)) out.favourites.push(f);
+    return out;
+  }
+  function mergePortfolio(cur, add) {
+    if (!add) return cur; if (!cur) return add;
+    const out = JSON.parse(JSON.stringify(cur));
+    for (const h of add.holdings) {
+      const i = out.holdings.findIndex(x => x.id === h.id);
+      if (i < 0) out.holdings.push(h);
+      else if (!(out.holdings[i].units > 0) && out.holdings[i].avgCost == null) out.holdings[i] = h; // placeholder on this device: take the backup's
+    }
+    return out;
+  }
+  function mergeAlerts(cur, add) {
+    if (!add) return cur; if (!cur) return add;
+    const out = JSON.parse(JSON.stringify(cur)), sig = r => r.sym + '|' + r.type + '|' + r.value;
+    const ids = new Set(out.rules.map(r => r.id)), sigs = new Set(out.rules.map(sig));
+    for (const r of add.rules) if (!ids.has(r.id) && !sigs.has(sig(r))) { out.rules.push(r); ids.add(r.id); sigs.add(sig(r)); }
+    const seen = new Set(out.history.map(h => JSON.stringify(h)));
+    for (const h of add.history) if (!seen.has(JSON.stringify(h))) out.history.push(h);
+    out.history.sort((a, b) => ((b && b.t) || 0) - ((a && a.t) || 0)); out.history = out.history.slice(0, 200);
+    return out;
+  }
+  function applyBackup(storage, parsed, { mode = 'replace', current = {} } = {}) {
+    const d = parsed.data, put = (k, v) => { if (v) storage.setItem(k, JSON.stringify(v)); };
+    if (mode === 'merge') {
+      const wlNow = (key, mem, norm) => (storage.getItem(key) == null ? (mem ? JSON.parse(JSON.stringify(mem)) : null) : loadWatchlist(storage, [], key, norm));
+      put(KEYS.watchlist, mergeWatchlist(wlNow(KEYS.watchlist, current.US, normalizeSymbol), d.watchlists.US));
+      put(KEYS.watchlistAsx, mergeWatchlist(wlNow(KEYS.watchlistAsx, current.ASX, normalizeAsx), d.watchlists.ASX));
+      put(KEYS.portfolio, mergePortfolio(storage.getItem(KEYS.portfolio) == null ? (current.portfolio || null) : loadPortfolio(storage), d.portfolio));
+      put(KEYS.alerts, mergeAlerts(storage.getItem(KEYS.alerts) == null ? (current.alerts || null) : loadAlerts(storage), d.alerts));
+      const s = cleanSettings(readRaw(storage, KEYS.settings));
+      if (!s.asxSheetUrl && d.settings.asxSheetUrl) s.asxSheetUrl = d.settings.asxSheetUrl;
+      storage.setItem(KEYS.settings, JSON.stringify(s));
+      if (d.keys) { const k = cleanKeys(readRaw(storage, KEYS.apiKeys)); for (const n of Object.keys(k)) if (!k[n] && d.keys[n]) k[n] = d.keys[n]; storage.setItem(KEYS.apiKeys, JSON.stringify(k)); }
+      return;
+    }
+    put(KEYS.watchlist, d.watchlists.US); put(KEYS.watchlistAsx, d.watchlists.ASX); put(KEYS.portfolio, d.portfolio); put(KEYS.alerts, d.alerts);
+    storage.setItem(KEYS.settings, JSON.stringify(Object.assign(cleanSettings(readRaw(storage, KEYS.settings)), d.settings)));
+    if (d.keys) storage.setItem(KEYS.apiKeys, JSON.stringify(d.keys));
+  }
+  // Backup bookkeeping: {lastAt, firstSeenAt, snoozeUntil}. The reminder is due 14 days after the last backup (or after first use).
+  function loadBackupMeta(storage, now = Date.now()) {
+    const m = readRaw(storage, KEYS.backup) || {};
+    const out = { lastAt: isNum(m.lastAt) ? m.lastAt : null, firstSeenAt: isNum(m.firstSeenAt) ? m.firstSeenAt : now, snoozeUntil: isNum(m.snoozeUntil) ? m.snoozeUntil : 0 };
+    if (!isNum(m.firstSeenAt)) storage.setItem(KEYS.backup, JSON.stringify(out));
+    return out;
+  }
+  function saveBackupMeta(storage, m) { storage.setItem(KEYS.backup, JSON.stringify(m)); }
+  function backupReminder(meta, now = Date.now(), days = BACKUP_REMIND_DAYS) {
+    const since = meta.lastAt || meta.firstSeenAt || now, daysSince = Math.floor((now - since) / DAY);
+    return { due: daysSince >= days && now >= (meta.snoozeUntil || 0), daysSince, never: !meta.lastAt };
   }
 
   // Display helper: undefined = provider never sends the field (free tier), null = sent but empty.
@@ -497,6 +751,8 @@
     fmtSignedMoney, normalizeAsx, makeId, parseId, SEED_PORTFOLIO, defaultPortfolio, loadPortfolio, savePortfolio, addHolding, updateHolding, removeHolding, portfolioSummary,
     ALERT_TYPES, emptyAlerts, loadAlerts, saveAlerts, addAlertRule, removeAlertRule, evaluateAlerts, alertMessage, unseenAlerts,
     topMovers, parseEarningsCalendar, upcomingEarnings, groupByDate, HOUR_LABEL, safeUrl, parseNews, fmtAgo,
-    parseMarketstackEod, eodQuote, parseTwelveRate, parseFrankfurter, monthKey, usDate, asxTtl };
+    parseMarketstackEod, eodQuote, parseTwelveRate, parseFrankfurter, monthKey, usDate, asxTtl,
+    SHEET_HEADER, SHEET_GUIDE, normalizeSheetUrl, parseCsv, sheetNum, sydneyToUtc, parseSheetQuotes, sheetFormula,
+    BACKUP_APP, BACKUP_VERSION, BACKUP_REMIND_DAYS, buildBackup, backupFileName, backupSummary, currentSummary, parseBackup, applyBackup, mergeWatchlist, mergePortfolio, mergeAlerts, loadBackupMeta, saveBackupMeta, backupReminder };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.SWL = api;
 })(typeof self !== 'undefined' ? self : this);

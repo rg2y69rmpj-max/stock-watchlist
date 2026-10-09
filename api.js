@@ -1,5 +1,6 @@
 /* Data layer: Finnhub (US quotes, profile, metrics, ratings, earnings, news), Twelve Data (price history, live USD/AUD),
-   Marketstack (ASX end-of-day closes, monthly budget) and Frankfurter (ECB daily USD/AUD fallback, no key).
+   your own Google Sheet (ASX prices via GOOGLEFINANCE, no key), Marketstack (optional: ASX end-of-day closes and 1-year charts, monthly budget)
+   and Frankfurter (ECB daily USD/AUD fallback, no key).
    Keys come from getKeys() at call time; they're never cached, logged or put in error messages.
    Works in the browser (window.SWAPI) and in Node for tests (inject fetch/storage/clock). */
 (function (root) {
@@ -10,12 +11,27 @@
     finnhub: { max: 55, windowMs: 60e3, minGapMs: 120 },
     twelvedata: { max: 8, windowMs: 60e3, minGapMs: 0, daily: 800 },
     marketstack: { max: 4, windowMs: 1000, minGapMs: 250, monthly: 100 }, // free: 100 requests/month, 5/second
-    frankfurter: { max: 10, windowMs: 60e3, minGapMs: 0 } // no published limit; we cache for 6 h anyway
+    frankfurter: { max: 10, windowMs: 60e3, minGapMs: 0 }, // no published limit; we cache for 6 h anyway
+    sheet: { max: 6, windowMs: 60e3, minGapMs: 1000 } // Google re-publishes about every 5 min; one request covers every ASX ticker
   };
   const MS_CHUNK = 25; // symbols per Marketstack call (each symbol is counted against the monthly budget)
   const SPARK_CHUNK = 6; // leaves 2 Twelve Data credits a minute for a chart you open while sparklines load
 
   function apiError(info, extra) { return Object.assign(new Error(info.message), info, extra || {}); }
+
+  // Fetch + parse a Google Sheet CSV (shared or published link). Used by the data source and by Settings → Test link.
+  async function fetchSheet(fetchFn, rawUrl) {
+    let n; try { n = L.normalizeSheetUrl(rawUrl); } catch (e) { throw apiError({ type: 'sheet', provider: 'sheet', message: e.message }); }
+    if (!n) throw apiError({ type: 'nokey', provider: 'sheet', message: 'Add your Google Sheet link in Settings to see ASX prices.' });
+    let res;
+    try { res = await fetchFn(n.url); } catch (e) { throw apiError({ type: 'network', provider: 'sheet', message: 'Couldn\u2019t reach Google Sheets. Check your connection, and that the sheet is shared (Anyone with the link) or published.' }); }
+    const text = res.text ? await res.text().catch(() => '') : '';
+    if (!res.ok) {
+      const msg = [400, 401, 403, 404].includes(res.status) ? `Google Sheets refused the link (HTTP ${res.status}). Share the sheet as \u201cAnyone with the link: Viewer\u201d, or use File \u2192 Share \u2192 Publish to web \u2192 CSV.` : 'Google Sheets error (HTTP ' + res.status + ').';
+      throw apiError({ type: res.status === 429 ? 'rate-limit' : 'sheet', provider: 'sheet', status: res.status, message: msg });
+    }
+    try { return Object.assign(L.parseSheetQuotes(text), { kind: n.kind }); } catch (e) { throw apiError({ type: 'sheet', provider: 'sheet', message: e.message }); }
+  }
 
   // persist: optional {storage, key} so the last minute of calls survives an app relaunch (iOS kills PWAs often).
   function createLimiter(cfg, now, sleep, persist) {
@@ -66,13 +82,16 @@
     const cache = L.createCache(storage, now);
     const fh = createLimiter(LIMITS.finnhub, now, sleep, { storage, key: 'stockwatch.rate.finnhub' });
     const td = createLimiter(LIMITS.twelvedata, now, sleep, { storage, key: 'stockwatch.rate.twelvedata' });
-    const ms = createLimiter(LIMITS.marketstack, now, sleep), fr = createLimiter(LIMITS.frankfurter, now, sleep);
+    const ms = createLimiter(LIMITS.marketstack, now, sleep), fr = createLimiter(LIMITS.frankfurter, now, sleep), sh = createLimiter(LIMITS.sheet, now, sleep);
+    const sheetNorm = () => { try { return L.normalizeSheetUrl(opts.getSheetUrl ? opts.getSheetUrl() : ''); } catch (e) { return null; } };
+    const sheetSet = () => !!sheetNorm();
+    const sheetKey = () => { let h = 2166136261; for (const c of (sheetNorm() || { url: '' }).url) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619); } return 'sheet:' + (h >>> 0).toString(36); }; // a new link never shows the old sheet's prices
     const msCap = () => { const c = Number(opts.marketstackCap ? opts.marketstackCap() : LIMITS.marketstack.monthly); return isFinite(c) && c >= 0 ? Math.min(c, 100000) : LIMITS.marketstack.monthly; };
     const inflight = new Map(), sparkPending = new Set();
     const qs = p => Object.keys(p).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(p[k])).join('&');
     const utcDay = () => new Date(now()).toISOString().slice(0, 10);
 
-    function usage() { let u = null; try { u = JSON.parse(storage.getItem(L.KEYS.usage)); } catch (e) { u = null; } return u && u.day === utcDay() ? u : { day: utcDay(), td: 0, fh: 0, fr: 0 }; }
+    function usage() { let u = null; try { u = JSON.parse(storage.getItem(L.KEYS.usage)); } catch (e) { u = null; } return u && u.day === utcDay() ? u : { day: utcDay(), td: 0, fh: 0, fr: 0, sh: 0 }; }
     function bump(field, n) { const u = usage(); u[field] = (u[field] || 0) + n; try { storage.setItem(L.KEYS.usage, JSON.stringify(u)); } catch (e) { /* full */ } }
     // Marketstack budget per calendar month (UTC), counted on this device. Your account quota resets on your billing date.
     function monthUsage() { let u = null; try { u = JSON.parse(storage.getItem(L.KEYS.usageMonth)); } catch (e) { u = null; } const m = L.monthKey(now()); return u && u.month === m ? u : { month: m, ms: 0 }; }
@@ -160,6 +179,14 @@
       }, { prio: 3 });
     }
 
+    function sheetGet(prio, view) {
+      return sh.schedule(async () => {
+        bump('sh', 1);
+        try { return await fetchSheet(fetchFn, opts.getSheetUrl ? opts.getSheetUrl() : ''); }
+        catch (e) { if (e.type === 'rate-limit') { sh.pause(60e3); emit('limit', { provider: 'sheet', message: 'Google Sheets is busy (HTTP 429). Waiting a minute.' }); } throw e; }
+      }, { prio, view });
+    }
+
     // Fresh cache -> return it. Otherwise fetch; on failure fall back to stale cache (flagged) or throw.
     // Premium-only responses are cached as {unavailable:'premium'} so we don't keep spending calls on them.
     function cached(key, ttl, loader, o = {}) {
@@ -207,8 +234,26 @@
       },
       /* ----- ASX (Marketstack end-of-day). Every symbol counts against the monthly budget, so nothing here runs on a timer by itself,
          and closes stay cached until the next ASX close is out (see L.asxTtl): at most one request per ticker per trading day. ----- */
-      asxCost(codes, o = {}) { return codes.filter(c => o.force || !cache.get('aq:' + c)).length; },
+      // Where ASX prices come from: your Google Sheet if its link is set, else Marketstack if its key is set.
+      asxMode: () => (sheetSet() ? 'sheet' : (getKeys().marketstack || '').trim() ? 'marketstack' : 'none'),
+      // Google Sheet: one request returns every ticker in the sheet (cached 5 min). Tickers that aren't in the sheet are marked notInSheet.
+      sheetQuotes(o = {}) {
+        return cached(sheetKey(), L.TTL.sheet, () => sheetGet(o.prio ?? 3, o.view).then(r => {
+          for (const c of Object.keys(r.quotes)) cache.set('aq:' + c, r.quotes[c], L.TTL.sheet);
+          for (const c of r.skipped) cache.set('aq:' + c, { notFound: true, sheetBlank: true }, L.TTL.sheet);
+          return { codes: Object.keys(r.quotes), skipped: r.skipped, kind: r.kind };
+        }), o);
+      },
+      asxCost(codes, o = {}) { return sheetSet() ? 0 : codes.filter(c => o.force || !cache.get('aq:' + c)).length; },
       asxQuotes(codes, o = {}) {
+        if (sheetSet()) {
+          return api.sheetQuotes(o).then(r => {
+            const got = new Set(r.value.codes.concat(r.value.skipped));
+            for (const c of new Set(codes)) if (!got.has(c)) cache.set('aq:' + c, { notFound: true, notInSheet: true }, L.TTL.sheet);
+            if (o.onUpdate) o.onUpdate(codes);
+            return { requested: 0, sheet: true, fresh: r.fresh !== false, error: r.error || null, missing: codes.filter(c => !got.has(c)) };
+          });
+        }
         const todo = [...new Set(codes)].filter(c => o.force || !cache.get('aq:' + c));
         if (!todo.length) return Promise.resolve({ requested: 0 });
         const jobs = [];
@@ -225,7 +270,7 @@
       asxHistory(code, o = {}) {
         return cached('ah:' + code, () => L.asxTtl(now()), () => msGet('/eod', { symbols: code + '.AX', date_from: daysAgo(366), limit: 400 }, 1, o.prio ?? 0, o.view).then(j => {
           const bars = L.parseMarketstackEod(j)[code] || [];
-          cache.set('aq:' + code, bars.length ? L.eodQuote(bars) : { notFound: true }, L.asxTtl(now()));
+          if (!sheetSet()) cache.set('aq:' + code, bars.length ? L.eodQuote(bars) : { notFound: true }, L.asxTtl(now())); // the sheet's price is fresher
           return bars;
         }), o);
       },
@@ -268,11 +313,11 @@
         return Promise.all(jobs).then(() => todo.length);
       },
       usage: () => ({ fhLastMinute: fh.usedLastMinute(), fhPending: fh.pending(), fhPausedMs: fh.pausedFor(), tdLastMinute: td.usedLastMinute(), tdPending: td.pending(),
-        tdToday: usage().td, fhToday: usage().fh, frToday: usage().fr || 0, msPending: ms.pending(), ms: msBudget(), pending: fh.pending() + td.pending() + ms.pending() + fr.pending(), limits: LIMITS }),
-      focus: view => fh.dropExcept(view) + td.dropExcept(view) + ms.dropExcept(view),
+        tdToday: usage().td, fhToday: usage().fh, frToday: usage().fr || 0, shToday: usage().sh || 0, msPending: ms.pending(), ms: msBudget(), pending: fh.pending() + td.pending() + ms.pending() + fr.pending() + sh.pending(), limits: LIMITS }),
+      focus: view => fh.dropExcept(view) + td.dropExcept(view) + ms.dropExcept(view) + sh.dropExcept(view),
       clearCache: () => cache.clear(),
       prune: () => cache.prune(),
-      cancelAll() { fh.clear(); td.clear(); ms.clear(); fr.clear(); sparkPending.clear(); }
+      cancelAll() { fh.clear(); td.clear(); ms.clear(); fr.clear(); sh.clear(); sparkPending.clear(); }
     };
     return api;
   }
@@ -350,15 +395,16 @@
       peekQuote: s => build(s).quote, peekProfile: s => build(s).profile, peekSpark: s => build(s).daily.slice(-22).map(b => b.c),
       sparklines: (symbols, onUpdate) => { symbols.forEach(s => onUpdate && onUpdate(s)); return Promise.resolve(symbols.length); },
       news: s => wrap(demoNews(s)), earningsCalendar: () => wrap(demoCalendar()),
+      asxMode: () => 'demo', sheetQuotes: () => Promise.resolve({ value: { codes: [], skipped: [] }, fresh: true }),
       asxCost: () => 0, asxQuotes: (codes, o = {}) => { if (o.onUpdate) o.onUpdate(codes); return Promise.resolve({ requested: 0 }); },
       asxHistory: c => wrap(asxBars(c)), peekAsxQuote: c => L.eodQuote(asxBars(c)), peekAsxHistory: c => asxBars(c),
       asxBudget: () => ({ used: 0, cap: LIMITS.marketstack.monthly, left: LIMITS.marketstack.monthly, month: L.monthKey(now()), demo: true }),
       fx: () => wrap({ rate: 1.5, t: now(), live: false, demo: true, source: 'DEMO rate (synthetic)' }), peekFx: () => ({ rate: 1.5, t: now(), demo: true, source: 'DEMO rate (synthetic)' }),
-      usage: () => ({ fhLastMinute: 0, fhPending: 0, fhPausedMs: 0, tdLastMinute: 0, tdPending: 0, tdToday: 0, fhToday: 0, frToday: 0, msPending: 0, pending: 0, ms: { used: 0, cap: 100, left: 100 }, limits: LIMITS }),
+      usage: () => ({ fhLastMinute: 0, fhPending: 0, fhPausedMs: 0, tdLastMinute: 0, tdPending: 0, tdToday: 0, fhToday: 0, frToday: 0, shToday: 0, msPending: 0, pending: 0, ms: { used: 0, cap: 100, left: 100 }, limits: LIMITS }),
       focus: () => 0, clearCache() { memo.clear(); }, prune() { return 0; }, cancelAll() {}
     };
   }
 
-  const out = { createDataSource, createDemoSource, createLimiter, LIMITS, SPARK_CHUNK, MS_CHUNK };
+  const out = { createDataSource, createDemoSource, createLimiter, fetchSheet, LIMITS, SPARK_CHUNK, MS_CHUNK };
   if (typeof module !== 'undefined' && module.exports) module.exports = out; else root.SWAPI = out;
 })(typeof self !== 'undefined' ? self : this);

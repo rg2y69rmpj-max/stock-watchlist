@@ -1,4 +1,4 @@
-// Mock Finnhub / Twelve Data / Marketstack / Frankfurter responses, shared by api.test.js and e2e.js. Numbers are made up for tests only.
+// Mock Finnhub / Twelve Data / Marketstack / Frankfurter / Google Sheets (CSV) responses, shared by api.test.js and e2e.js. Numbers are made up for tests only.
 function hash(s) { let h = 7; for (const c of s) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h; }
 function quote(sym) { const h = hash(sym), pc = 50 + (h % 900), dp = ((h % 801) - 400) / 100; const c = +(pc * (1 + dp / 100)).toFixed(2); return { c, d: +(c - pc).toFixed(2), dp, h: c * 1.01, l: c * 0.99, o: pc, pc, t: 1791403200 }; }
 function profile(sym) { return { ticker: sym, name: sym + ' Mock Corp', marketCapitalization: 1000 + (hash(sym) % 50000), shareOutstanding: 100 + (hash(sym) % 9000), currency: 'USD', exchange: 'NASDAQ' }; }
@@ -57,7 +57,16 @@ function bars(interval, n) {
   return out.slice(-n).reverse(); // newest first, like the real API
 }
 function series(sym, interval, n) { return { meta: { symbol: sym, interval, currency: 'USD', exchange_timezone: 'America/New_York' }, values: bars(interval, n), status: 'ok' }; }
-// Returns {status, body} for a URL, or null if the host isn't mocked.
+// A user's Google Sheet built from the app's formula, as CSV (published or shared link). Prices are made up.
+// opts.sheetCodes: tickers in the sheet (default FANG, SEMI, IVV, BHP, CBA, STW), opts.sheetBlank: codes whose price is #N/A, opts.sheetStatus: HTTP status.
+const SHEET_CODES = ['FANG', 'SEMI', 'IVV', 'BHP', 'CBA', 'STW'];
+function sheetPrice(code) { const h = hash('sheet' + code); const prev = +(10 + (h % 9000) / 100).toFixed(2), price = +(prev * (1 + ((h % 401) - 200) / 10000)).toFixed(2); return { price, prev }; }
+function sheetCsv(codes = SHEET_CODES, blank = []) {
+  const lines = ['Symbol,Price,PrevClose,TradeTime'];
+  for (const c of codes) { const p = sheetPrice(c); lines.push(blank.includes(c) ? `${c},#N/A,#N/A,` : `${c},"A$${p.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}",${p.prev},2026-10-08 15:20`); }
+  return lines.join('\r\n');
+}
+// Returns {status, body} (or {status, text, contentType} for CSV) for a URL, or null if the host isn't mocked.
 function respond(url, opts = {}) {
   const u = new URL(url), sym = u.searchParams.get('symbol') || '';
   if (u.hostname === 'finnhub.io') {
@@ -91,10 +100,15 @@ function respond(url, opts = {}) {
     if (u.pathname === '/v2/eod') return { status: 200, body: marketstackEod((u.searchParams.get('symbols') || '').split(','), u.searchParams.get('date_from'), opts.now || Date.now()) };
     return { status: 404, body: { error: { code: 'not_found', message: 'not mocked' } } };
   }
+  if (u.hostname === 'docs.google.com' && u.pathname.startsWith('/spreadsheets/d/')) {
+    if (opts.sheetStatus && opts.sheetStatus !== 200) return { status: opts.sheetStatus, text: '<!DOCTYPE html><html>Sign in</html>', contentType: 'text/html' };
+    if (!/\/pub$|\/gviz\/tq$/.test(u.pathname) || (u.pathname.endsWith('/pub') && u.searchParams.get('output') !== 'csv')) return { status: 404, text: 'not mocked', contentType: 'text/plain' };
+    return { status: 200, text: sheetCsv(opts.sheetCodes || SHEET_CODES, opts.sheetBlank || []), contentType: 'text/csv' };
+  }
   if (u.hostname === 'api.frankfurter.dev') {
     if (opts.frankfurterDown) return { status: 500, body: { message: 'down' } };
     return { status: 200, body: { amount: 1, base: 'USD', date: '2026-10-07', rates: { AUD: 1.4 } } };
   }
   return null;
 }
-module.exports = { respond, quote, profile, metric, recommendation, earnings, series, news, calendar, marketstackEod };
+module.exports = { respond, quote, profile, metric, recommendation, earnings, series, news, calendar, marketstackEod, sheetCsv, sheetPrice, SHEET_CODES };

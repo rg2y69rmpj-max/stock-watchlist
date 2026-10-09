@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://finnhub.io https://api.twelvedata.com https://api.marketstack.com https://api.frankfurter.dev; manifest-src 'self'; worker-src 'self'; base-uri 'self'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://finnhub.io https://api.twelvedata.com https://api.marketstack.com https://api.frankfurter.dev https://docs.google.com https://*.googleusercontent.com; manifest-src 'self'; worker-src 'self'; base-uri 'self'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#0b0f14">
 <meta name="color-scheme" content="dark">
@@ -38,7 +38,8 @@
       <ol class="steps">
         <li><b>Finnhub</b> (required): prices, company info, metrics, analyst ratings and earnings dates. Free key at <a href="https://finnhub.io/register" target="_blank" rel="noopener noreferrer">finnhub.io/register</a>.</li>
         <li><b>Twelve Data</b> (optional): price charts, sparklines and a live USD/AUD rate. Free key at <a href="https://twelvedata.com/register" target="_blank" rel="noopener noreferrer">twelvedata.com/register</a>.</li>
-        <li><b>Marketstack</b> (optional): ASX end-of-day closes in AUD, 100 requests a month. Free key at <a href="https://marketstack.com/signup/free" target="_blank" rel="noopener noreferrer">marketstack.com</a>. You can add it later in Settings.</li>
+        <li><b>ASX prices</b> (FANG, SEMI, IVV and the rest): free through a Google Sheet you own, no key or card. Set it up in <b>Settings → ASX prices</b> (about 3 minutes).</li>
+        <li><b>Marketstack</b> (optional): 1-year charts for ASX tickers from end-of-day closes, 100 requests a month on its free plan. You can add it later in Settings.</li>
       </ol>
       <form id="setupForm" class="keys" autocomplete="off">
         <label>Finnhub API key<input name="finnhub" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste key"></label>
@@ -47,12 +48,14 @@
       </form>
       <div class="or">or</div>
       <button id="tryDemo" class="ghost wide" type="button">Try with DEMO data</button>
+      <button id="setupAsx" class="ghost wide" type="button" style="margin-top:8px">Only want ASX prices? Set up the free Google Sheet</button>
       <p class="muted small">DEMO mode uses made-up numbers and is labelled DEMO on every screen.</p>
     </div>
   </section>
 
   <!-- LIST -->
   <section id="v-list" class="view" hidden>
+    <div id="backupNudge" class="card nudge small" hidden></div>
     <div class="seg" role="tablist" aria-label="Market">
       <button type="button" role="tab" data-market="US" id="mkUS">US · USD</button>
       <button type="button" role="tab" data-market="ASX" id="mkASX">ASX · AUD</button>
@@ -145,7 +148,7 @@
       <div id="pfMsg" class="small muted"></div>
     </form>
     <ul id="pfList" class="pf-list"></ul>
-    <p class="muted small pad">Holdings are saved only on this device. US holdings are converted to AUD at the current USD/AUD rate, and so is their cost, so the gain shows the share-price move only, not currency moves since you bought. ASX values use the latest end-of-day close.</p>
+    <p class="muted small pad">Holdings are saved only on this device. US holdings are converted to AUD at the current USD/AUD rate, and so is their cost, so the gain shows the share-price move only, not currency moves since you bought. ASX values use the latest price from your Google Sheet (delayed up to ~20 min), or the latest end-of-day close if you use Marketstack instead.</p>
   </section>
 
   <!-- EARNINGS -->
@@ -192,11 +195,40 @@
       <form id="keysForm" class="keys" autocomplete="off">
         <label>Finnhub API key<input name="finnhub" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Not set"></label>
         <label>Twelve Data API key (charts, live USD/AUD, optional)<input name="twelvedata" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Not set"></label>
-        <label>Marketstack access key (ASX end-of-day, optional)<input name="marketstack" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Not set"></label>
+        <label>Marketstack access key (optional: ASX charts, end-of-day fallback)<input name="marketstack" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Not set"></label>
         <label class="check"><input type="checkbox" id="showKeys"> Show keys</label>
         <div class="row"><button class="primary grow" type="submit">Save keys</button><button id="clearKeys" class="ghost" type="button">Remove keys</button></div>
         <div id="keysMsg" class="small muted"></div>
       </form>
+    </div>
+    <div class="card" id="asxCard">
+      <h2>ASX prices (free, via your Google Sheet)</h2>
+      <p class="small muted">The free plans of Finnhub and Twelve Data don't include the ASX. A Google Sheet you own can look up Google Finance prices (delayed up to ~20 min) and share them with this app: free, no card, no key. The sheet only holds ticker codes and prices, never your holdings.</p>
+      <details id="sheetHow" class="how small">
+        <summary id="sheetHowTitle">How to set it up on iPhone</summary>
+        <ol id="sheetSteps" class="steps"></ol>
+        <p class="muted" id="sheetByHandHead"></p>
+        <pre id="sheetByHand" class="formula-lines"></pre>
+        <p class="muted" id="sheetByHandTail"></p>
+        <ul id="sheetNotes" class="steps muted"></ul>
+        <p class="muted">On a computer instead? File → Share → Publish to web → Comma-separated values (.csv) → Publish, then paste that link. Added an ASX ticker later? Tap Copy formula again and paste it over A1.</p>
+      </details>
+      <label>Google Sheet link<input id="sheetUrl" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://docs.google.com/spreadsheets/d/…"></label>
+      <div class="row"><button id="sheetSave" class="primary grow" type="button">Save and test</button><button id="sheetCopy" class="ghost grow" type="button">Copy formula</button></div>
+      <div id="sheetMsg" class="small muted" role="status"></div>
+      <textarea id="sheetFormula" class="formula" readonly rows="4" hidden aria-label="Formula for cell A1"></textarea>
+      <button id="sheetRemove" class="ghost sm" type="button" hidden>Remove link</button>
+    </div>
+    <div class="card" id="backupCard">
+      <h2>Backup</h2>
+      <p id="backupLast" class="small"></p>
+      <p class="small muted">One JSON file with your watchlists, favourites, portfolio, alerts and settings (including the Google Sheet link). On iPhone the share sheet offers <b>Save to Files</b>, where you can pick iCloud Drive.</p>
+      <label class="check"><input type="checkbox" id="backupKeys"> Include API keys</label>
+      <p class="small muted">Off by default: anyone who has a file with keys can use them. Without keys, re-enter them after a restore.</p>
+      <div class="row"><button id="backupNow" class="primary grow" type="button">Back up now</button><button id="restoreBtn" class="ghost grow" type="button">Restore from backup</button></div>
+      <input type="file" id="restoreFile" accept="application/json,.json" hidden>
+      <div id="restorePreview" class="restore small" hidden></div>
+      <div id="backupMsg" class="small muted" role="status"></div>
     </div>
     <div class="card">
       <h2>Data</h2>
@@ -222,10 +254,11 @@
       <h2>About the data</h2>
       <p><b>Finnhub free</b> (60 calls/min): quote, company profile, basic financials, recommendation trends, earnings calendar. Price targets and candles are premium, so price targets show <i>n/a (not on free tier)</i>.</p>
       <p><b>Twelve Data free</b> (8 credits/min, 800/day): price history for the chart and the 1-month sparklines (1M, 6M and 1Y share one daily series), and the live USD/AUD rate. ASX symbols are not on the free plan.</p>
-      <p><b>Marketstack free</b> (100 requests/month, every symbol counts): the only free source we found that a web page can call for ASX prices. End-of-day closes only, about 1 year of history. Nothing ASX loads on a timer except your portfolio holdings.</p>
+      <p><b>Your Google Sheet</b> (free, no key): ASX prices from Google Finance through the GOOGLEFINANCE formula, delayed up to about 20 minutes, refreshed by Google about every 5 minutes. One request covers every ASX ticker; cached 5 min.</p>
+      <p><b>Marketstack free</b> (optional, 100 requests/month, every symbol counts): 1 year of ASX end-of-day closes for the detail chart, and end-of-day prices if you haven't connected a sheet. Its free plan has no card, but asks for a billing address at sign-up.</p>
       <p><b>Frankfurter</b> (no key): ECB daily reference USD/AUD rate, used when there's no Twelve Data key.</p>
-      <p><b>Not available free for ASX:</b> live or intraday prices, analyst ratings, price targets, metrics, news and earnings dates. These show <i>n/a</i> with the reason.</p>
-      <p>Responses are cached on this device: quotes 1 min, news 30 min, metrics and ratings 12 h, earnings calendar 6 h, profiles 7 days, charts 5 min (1D) to 24 h (5Y), ASX closes until the next close is out (6 pm Sydney time, trading days), USD/AUD 10 min (live) or 6 h (ECB). Data may be delayed. Not financial advice.</p>
+      <p><b>Not available free for ASX:</b> real-time prices, intraday charts, analyst ratings, price targets, metrics, news and earnings dates. These show <i>n/a</i> with the reason.</p>
+      <p>Responses are cached on this device: quotes 1 min, news 30 min, metrics and ratings 12 h, earnings calendar 6 h, profiles 7 days, charts 5 min (1D) to 24 h (5Y), ASX prices from your sheet 5 min, Marketstack closes until the next close is out (6 pm Sydney time, trading days), USD/AUD 10 min (live) or 6 h (ECB). Data may be delayed. Not financial advice.</p>
     </div>
   </section>
 </main>
