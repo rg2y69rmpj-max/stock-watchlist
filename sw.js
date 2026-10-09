@@ -1,7 +1,7 @@
 /* Service worker: cache-first app shell, network-first market data.
    API responses are cached under a URL with any key parameter removed, so keys never land in Cache Storage.
    Notifications are only shown by the open app (no push: that would need a server); tapping one focuses the app. */
-const SHELL = 'stockwatch-shell-v4';
+const SHELL = 'stockwatch-shell-v5';
 const DATA = 'stockwatch-data-v4';
 const ASSETS = ['./', 'index.html', 'styles.css', 'logic.js', 'api.js', 'chart.js', 'app.js', 'manifest.webmanifest', 'data/default-watchlist.json', 'data/asx-watchlist.json',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png', 'icons/apple-touch-icon-180.png', 'favicon.ico'];

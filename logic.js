@@ -4,7 +4,7 @@
   const NA_FREE = 'n/a (not on free tier)';
   const NA_NONE = 'n/a (not reported)';
   const KEYS = { watchlist: 'stockwatch.watchlist.v1', watchlistAsx: 'stockwatch.watchlist.asx.v1', settings: 'stockwatch.settings.v1', apiKeys: 'stockwatch.keys.v1',
-    usage: 'stockwatch.usage.v1', usageMonth: 'stockwatch.usage.month.v1', portfolio: 'stockwatch.portfolio.v1', alerts: 'stockwatch.alerts.v1', backup: 'stockwatch.backup.v1' };
+    usage: 'stockwatch.usage.v1', usageMonth: 'stockwatch.usage.month.v1', portfolio: 'stockwatch.portfolio.v1', alerts: 'stockwatch.alerts.v1', backup: 'stockwatch.backup.v1', valueHistory: 'stockwatch.pfvalue.v1' };
   const CACHE_PREFIX = 'stockwatch.cache.';
   const MIN = 60e3, HOUR = 60 * MIN, DAY = 24 * HOUR;
   const TTL = { quote: MIN, profile: 7 * DAY, metrics: 12 * HOUR, recommendation: 12 * HOUR, earnings: 12 * HOUR, priceTarget: 12 * HOUR, spark: 12 * HOUR,
@@ -358,6 +358,83 @@
       total: { value: valued.length ? totalValue : null, cost: complete.length ? cCost : null, gain: complete.length ? cGain : null, gainPct: cCost > 0 ? cGain / cCost * 100 : null,
         dayChange: dayRows.length ? dayTotal : null, dayPct: dayRows.length && prevValue > 0 ? dayTotal / prevValue * 100 : null },
       missing: rows.filter(r => r.missingPrice).map(r => r.symbol), needsInput: rows.filter(r => r.needsInput).map(r => r.symbol) };
+  }
+
+  /* ---------- portfolio value over time ----------
+     No free source gives a portfolio's history, and Google Sheets won't hand GOOGLEFINANCE history to other apps. So the chart is built from:
+     1. 'snap': the total saved on this device (KEYS.valueHistory) each day the Portfolio tab shows a complete total from real prices (never DEMO);
+     2. 'prev': the previous close behind each saved day (total minus today's change), dated the weekday before;
+     3. 'eod':  end-of-day closes already cached on this device (Marketstack for ASX, Twelve Data for US) × today's units. Never fetched for the chart. */
+  const VALUE_HISTORY_MAX = 800; // days kept
+  const PF_RANGES = { '1M': 31, '3M': 92, '1Y': 366, All: null };
+  const PF_RANGE_ORDER = ['1M', '3M', '1Y', 'All'];
+  function holdingsSig(holdings) { return holdings.filter(h => h.units > 0).map(h => h.id + '=' + h.units).sort().join(','); }
+  function prevWeekday(iso) { const d = new Date(iso + 'T00:00:00Z'); do d.setUTCDate(d.getUTCDate() - 1); while (d.getUTCDay() === 0 || d.getUTCDay() === 6); return d.toISOString().slice(0, 10); }
+  function loadValueHistory(storage) {
+    let raw = null; try { raw = JSON.parse(storage.getItem(KEYS.valueHistory)); } catch (e) { raw = null; }
+    const days = raw && Array.isArray(raw.days) ? raw.days.filter(x => x && /^\d{4}-\d{2}-\d{2}$/.test(x.d) && isNum(x.v) && x.v > 0) : [];
+    days.sort((a, b) => (a.d < b.d ? -1 : a.d > b.d ? 1 : 0));
+    return { version: 1, days };
+  }
+  // Which day a valuation belongs to: the latest trade date among the prices used (ASX sheet/EOD date, or a quote time read in local time), else today.
+  function snapshotDate(quotes, todayIso) {
+    let best = '';
+    for (const q of quotes) { if (!q) continue; const d = q.date || (isNum(q.t) ? isoDate(new Date(q.t)) : ''); if (/^\d{4}-\d{2}-\d{2}$/.test(d) && d > best) best = d; }
+    return best && (!todayIso || best <= todayIso) ? best : todayIso;
+  }
+  // Save today's total (one entry per day; later loads that day replace it). Only a complete total counts: every holding with units priced, FX loaded.
+  // Returns the saved entry, or null with nothing written.
+  function recordValueSnapshot(storage, sum, holdings, o = {}) {
+    if (!sum || !sum.total || !isNum(sum.total.value) || !(sum.total.value > 0) || sum.missing.length || sum.fxMissing || o.demo) return null;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(o.date || '')) return null;
+    const valued = sum.rows.filter(r => r.units > 0 && r.value !== null), allDay = valued.length && valued.every(r => r.dayChange !== null);
+    const e = { d: o.date, v: +sum.total.value.toFixed(2), pc: allDay ? +(sum.total.value - sum.total.dayChange).toFixed(2) : null, t: isNum(o.t) ? o.t : Date.now(), sig: holdingsSig(holdings) };
+    const h = loadValueHistory(storage), i = h.days.findIndex(x => x.d === e.d);
+    if (i >= 0) { const o2 = h.days[i]; if (o2.v === e.v && o2.pc === e.pc && o2.sig === e.sig) return o2; h.days[i] = e; } else h.days.push(e);
+    h.days.sort((a, b) => (a.d < b.d ? -1 : 1));
+    if (h.days.length > VALUE_HISTORY_MAX) h.days = h.days.slice(-VALUE_HISTORY_MAX);
+    try { storage.setItem(KEYS.valueHistory, JSON.stringify(h)); } catch (err) { return null; }
+    return e;
+  }
+  // Rebuild past totals from cached daily closes × today's units. barsFor(holding) -> [{d, c}] in the listing currency or null.
+  // All-or-nothing: if any holding with units has no cached closes, nothing is backfilled (a partial total would look like a crash).
+  function backfillValues(holdings, barsFor, fx) {
+    const rate = fx && isNum(fx.rate) && fx.rate > 0 ? fx.rate : null;
+    const held = holdings.filter(h => h.units > 0), missing = [];
+    const series = held.map(h => {
+      const bars = (barsFor(h) || []).filter(b => b && isNum(b.c) && b.c > 0 && typeof b.d === 'string').map(b => ({ d: b.d.slice(0, 10), c: b.c })).sort((a, b) => (a.d < b.d ? -1 : 1));
+      if (!bars.length || (h.exchange === 'US' && rate === null)) missing.push(h.symbol);
+      return { h, bars, mult: h.exchange === 'US' ? rate : 1 };
+    });
+    if (!held.length || missing.length) return { points: [], missing };
+    const start = series.reduce((m, s) => (s.bars[0].d > m ? s.bars[0].d : m), '');
+    const dates = [...new Set(series.flatMap(s => s.bars.map(b => b.d)))].filter(d => d >= start).sort();
+    const idx = series.map(() => 0), last = series.map(() => null), points = [];
+    for (const d of dates) {
+      let v = 0;
+      series.forEach((s, k) => { while (idx[k] < s.bars.length && s.bars[idx[k]].d <= d) last[k] = s.bars[idx[k]++].c; v += s.h.units * last[k] * s.mult; });
+      points.push({ d, v: +v.toFixed(2), src: 'eod' });
+    }
+    return { points, missing: [] };
+  }
+  // Merge the three sources into one daily series for a range. Saved days win over rebuilt ones; a live "now" total (if given) is the last point.
+  function buildValueSeries(o) {
+    const map = new Map();
+    for (const p of (o.backfill || [])) map.set(p.d, { d: p.d, v: p.v, src: 'eod' });
+    const snaps = (o.snapshots || []).filter(s => isNum(s.v));
+    for (const s of snaps) if (isNum(s.pc) && s.pc > 0) { const pd = prevWeekday(s.d); if (!map.has(pd) && !snaps.some(x => x.d === pd)) map.set(pd, { d: pd, v: s.pc, src: 'prev' }); }
+    for (const s of snaps) map.set(s.d, { d: s.d, v: s.v, src: 'snap', sig: s.sig });
+    if (o.current && isNum(o.current.v) && o.current.v > 0 && o.current.d) map.set(o.current.d, { d: o.current.d, v: +o.current.v.toFixed(2), src: 'now', sig: o.current.sig });
+    let pts = [...map.values()].sort((a, b) => (a.d < b.d ? -1 : 1));
+    const days = PF_RANGES[o.range] ?? null;
+    const available = pts.length ? { from: pts[0].d, to: pts[pts.length - 1].d } : null;
+    if (days && pts.length) { const end = new Date(pts[pts.length - 1].d + 'T00:00:00Z'); end.setUTCDate(end.getUTCDate() - days); const from = end.toISOString().slice(0, 10); pts = pts.filter(p => p.d >= from); }
+    const sources = { eod: 0, snap: 0, prev: 0, now: 0 }; pts.forEach(p => { sources[p.src]++; });
+    const sigs = new Set(pts.filter(p => p.sig).map(p => p.sig));
+    const first = pts[0] || null, lastP = pts[pts.length - 1] || null;
+    const change = pts.length > 1 ? lastP.v - first.v : null;
+    return { points: pts, first, last: lastP, change, changePct: change !== null && first.v > 0 ? change / first.v * 100 : null, sources, available,
+      holdingsChanged: sigs.size > 1, spanDays: pts.length > 1 ? Math.round((Date.parse(lastP.d) - Date.parse(first.d)) / DAY) : 0 };
   }
 
   /* ---------- alerts ---------- */
@@ -749,6 +826,7 @@
     createCache, waitTime, parseFinnhubQuote, parseFinnhubProfile, parseFinnhubMetrics, latestRecommendation, consensus, nextEarnings,
     parseFinnhubPriceTarget, parseTwelveSeries, sliceRange, rangeChange, sessionVolume, sparkPath, marketCap, classifyError, show,
     fmtSignedMoney, normalizeAsx, makeId, parseId, SEED_PORTFOLIO, defaultPortfolio, loadPortfolio, savePortfolio, addHolding, updateHolding, removeHolding, portfolioSummary,
+    VALUE_HISTORY_MAX, PF_RANGES, PF_RANGE_ORDER, holdingsSig, prevWeekday, loadValueHistory, snapshotDate, recordValueSnapshot, backfillValues, buildValueSeries,
     ALERT_TYPES, emptyAlerts, loadAlerts, saveAlerts, addAlertRule, removeAlertRule, evaluateAlerts, alertMessage, unseenAlerts,
     topMovers, parseEarningsCalendar, upcomingEarnings, groupByDate, HOUR_LABEL, safeUrl, parseNews, fmtAgo,
     parseMarketstackEod, eodQuote, parseTwelveRate, parseFrankfurter, monthKey, usDate, asxTtl,

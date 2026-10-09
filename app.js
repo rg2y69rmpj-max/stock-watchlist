@@ -539,6 +539,67 @@
         `<div class="pf-sub"><span>${r.dayChange !== null ? 'Today ' + `<span class="${L.direction(r.dayChange)}-t">${L.fmtSignedMoney(r.dayChange, 'AUD')}</span>` : r.units > 0 ? 'Today —' : ''}${r.buyDate ? ' · bought ' + esc(L.fmtBarTime(r.buyDate)) : ''}</span><span data-weight="${esc(r.id)}">${r.weight !== null && r.units > 0 ? r.weight.toFixed(1) + '% of total' : ''}</span></div>` +
         (r.weight !== null && r.units > 0 ? `<div class="wbar"><span style="width:${Math.min(100, r.weight).toFixed(1)}%"></span></div>` : '') + '</li>';
     }).join('') || '<li class="muted">No holdings. Tap ＋ Holding.</li>';
+    renderPfChart(sum);
+  }
+  /* ---------- portfolio value chart (AUD). Built only from what's already on this device: no request is made for it and no key is needed. ---------- */
+  const PF_SRC = { eod: 'end-of-day close × today\u2019s units', snap: 'saved on this device', prev: 'previous close', now: 'now' };
+  const dayLabel = d => shortDate(d) + (d.slice(0, 4) !== today().slice(0, 4) ? ' ' + d.slice(0, 4) : '');
+  const PF_TIP = 'Touch and drag on the chart to see the value on each day';
+  const pfChart = window.SWChart.PriceChart($('#pfChart'), {
+    formatY: v => (v >= 1e6 ? (v / 1e6).toFixed(2) + 'M' : v >= 1e4 ? (v / 1e3).toFixed(1) + 'K' : Math.round(v).toLocaleString('en-US')),
+    formatTip: b => L.fmtPrice(b.c, 'AUD') + '  ' + shortDate(b.d),
+    onHover: b => { const t = $('#pfChartTip'); if (b) { t.textContent = L.fmtPrice(b.c, 'AUD') + ' · ' + L.fmtBarTime(b.d) + ' · ' + (src && src.demo ? 'DEMO' : PF_SRC[b.src] || ''); t.classList.add('on'); } else { t.textContent = PF_TIP; t.classList.remove('on'); } }
+  });
+  $('#pfRanges').innerHTML = L.PF_RANGE_ORDER.map(r => `<button type="button" role="tab" data-pfrange="${r}">${r}</button>`).join('');
+  $('#pfRanges').addEventListener('click', e => { const b = e.target.closest('[data-pfrange]'); if (b && !b.disabled) { settings.pfRange = b.dataset.pfrange; saveSettings(); renderPortfolio(); } });
+  const pfBars = h => { const b = h.exchange === 'ASX' ? src.peekAsxHistory(h.symbol) : src.peekCandles(h.symbol, 'd1y'); return Array.isArray(b) ? b : null; }; // cache only
+  function renderPfChart(sum) {
+    const demo = !!src.demo, t = sum.total, held = pf.holdings.filter(h => h.units > 0);
+    $('#pfChartBadge').hidden = !demo;
+    const complete = held.length > 0 && t.value !== null && t.value > 0 && !sum.missing.length && !sum.fxMissing;
+    const date = L.snapshotDate(held.map(h => quoteFor(h.id)), today());
+    if (complete && !demo) L.recordValueSnapshot(store, sum, pf.holdings, { date, t: Date.now() }); // real prices only; DEMO never touches the history
+    const snaps = demo ? [] : L.loadValueHistory(store).days;
+    const bf = held.length ? L.backfillValues(pf.holdings, pfBars, src.peekFx()) : { points: [], missing: [] };
+    let range = L.PF_RANGES[settings.pfRange] !== undefined ? settings.pfRange : 'All';
+    const all = L.buildValueSeries({ snapshots: snaps, backfill: bf.points, current: complete ? { d: date, v: t.value, sig: L.holdingsSig(pf.holdings) } : null, range: 'All' });
+    const availDays = all.spanDays;
+    const ranges = L.PF_RANGE_ORDER.map((r, i) => ({ r, off: i > 0 && r !== 'All' && availDays <= L.PF_RANGES[L.PF_RANGE_ORDER[i - 1]] })); // longer range would look the same as the shorter one
+    if (ranges.find(x => x.r === range).off) range = 'All';
+    document.querySelectorAll('#pfRanges button').forEach(b => { const x = ranges.find(y => y.r === b.dataset.pfrange); b.disabled = x.off; b.classList.toggle('on', x.r === range); b.setAttribute('aria-selected', String(x.r === range)); });
+    const s = range === 'All' ? all : L.buildValueSeries({ snapshots: snaps, backfill: bf.points, current: complete ? { d: date, v: t.value, sig: L.holdingsSig(pf.holdings) } : null, range });
+    const bars = s.points.map(p => ({ d: p.d, c: p.v, src: p.src, hollow: p.src === 'prev' }));
+    const msg = !held.length ? 'Enter units to see your value over time' : !complete && !bars.length ? 'Waiting for prices…' : 'Not enough history yet';
+    pfChart.set(bars, { range: s.spanDays > 70 ? '1Y' : '1M', timeX: true, dots: true, demo, message: msg });
+    const head = $('#pfChartHead'), notes = [];
+    if (!held.length) { head.innerHTML = ''; $('#pfChartRange').textContent = ''; $('#pfChartNote').textContent = 'Your total in A$ over time appears here once a holding has units.'; return; }
+    const nowV = complete ? t.value : s.last ? s.last.v : null;
+    if (s.points.length > 1) {
+      const ch = nowV - s.first.v, pct = s.first.v > 0 ? ch / s.first.v * 100 : null;
+      head.innerHTML = `<b id="pfChartNow">${L.fmtPrice(nowV, 'AUD')}</b><span id="pfChartChange" class="${L.direction(ch)}-t">${L.fmtSignedMoney(ch, 'AUD')} (${L.fmtPct(pct)})</span>` +
+        `<span class="muted" id="pfChartStart">${complete ? 'Now' : 'On ' + esc(dayLabel(s.last.d))} vs ${esc(dayLabel(s.first.d))}: ${L.fmtPrice(s.first.v, 'AUD')}${s.first.src === 'prev' ? ' (previous close)' : ''}</span>`;
+    } else head.innerHTML = nowV !== null ? `<b id="pfChartNow">${L.fmtPrice(nowV, 'AUD')}</b><span class="muted">${complete ? 'now' : ''}</span>` : '';
+    if (s.points.length) {
+      const want = L.PF_RANGES[range], short = want && s.spanDays + 3 < want;
+      $('#pfChartRange').textContent = (s.points.length > 1 ? L.fmtBarTime(s.first.d) + ' \u2013 ' + L.fmtBarTime(s.last.d) : L.fmtBarTime(s.last.d)) + ' · ' + s.points.length + (s.points.length === 1 ? ' daily point' : ' daily points') +
+        (short || range === 'All' ? ' · all the history on this device' : '');
+    } else $('#pfChartRange').textContent = '';
+    if (demo) notes.push('DEMO: synthetic closes × your units, at the DEMO rate. Nothing is added to your real chart history in DEMO mode.');
+    else {
+      if (s.sources.eod) notes.push('Earlier days: rebuilt from end-of-day closes already cached on this device × today\u2019s units' + (held.some(h => h.exchange === 'US') ? ' (US at today\u2019s USD/AUD rate)' : '') + ', so past buys and sells don\u2019t show.');
+      const dots = bars.length <= 60;
+      if (s.sources.snap || s.sources.now) notes.push((dots ? 'Solid dots' : 'Recent days') + ': your total, saved on this device once a day when Portfolio shows a full set of prices.');
+      if (s.sources.prev) notes.push((dots ? 'Hollow dots' : 'Days before a saved day') + ': the previous close (total minus today\u2019s change), dated the weekday before.');
+      if (bf.missing.length) {
+        const asxMiss = held.filter(h => h.exchange === 'ASX' && bf.missing.includes(h.symbol)).map(h => h.symbol), usMiss = held.filter(h => h.exchange === 'US' && bf.missing.includes(h.symbol)).map(h => h.symbol);
+        const canFill = (asxMiss.length && hasKey('marketstack')) || (usMiss.length && hasKey('twelvedata'));
+        notes.push(canFill ? 'For up to a year of history, open the chart of ' + bf.missing.join(', ') + ' once; the closes it caches are used here.'
+          : 'Google Sheets can\u2019t share past prices with other apps, so this chart builds up from the day you start: one point per day you open the app.');
+      }
+      if (s.holdingsChanged) notes.push('Your holdings changed in this period, so part of the move is buying or selling, not price.');
+      if (!complete) notes.push(sum.missing.length ? 'Not saved today: no price yet for ' + sum.missing.join(', ') + '.' : sum.fxMissing ? 'Not saved today: waiting for the USD/AUD rate.' : 'Waiting for prices.');
+    }
+    $('#pfChartNote').innerHTML = notes.map(esc).join('<br>');
   }
   function loadPortfolio(force) {
     if (!src) return;
@@ -883,6 +944,6 @@
       }).catch(() => {});
     }
   }
-  window.__app = { backupNow, get settings() { return settings; }, get src() { return src; }, get wl() { return wls.US; }, get wls() { return wls; }, get pf() { return pf; }, get alerts() { return alerts; }, chart, checkAlerts, notifyCount: 0 };
+  window.__app = { backupNow, get settings() { return settings; }, get src() { return src; }, get wl() { return wls.US; }, get wls() { return wls; }, get pf() { return pf; }, get alerts() { return alerts; }, chart, checkAlerts, pfChart, notifyCount: 0 };
   boot();
 })();

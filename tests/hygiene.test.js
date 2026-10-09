@@ -35,7 +35,7 @@ const text = files.filter(f => /\.(js|json|html|css|md|webmanifest|py|txt)$|\.gi
     const assets = JSON.parse(sw.match(/const ASSETS = (\[[\s\S]*?\]);/)[1].replace(/'/g, '"'));
     for (const a of assets) if (a !== './') assert.ok(fs.existsSync(path.join(ROOT, a)), a);
     for (const f of ['index.html', 'app.js', 'logic.js', 'api.js', 'chart.js', 'styles.css', 'data/default-watchlist.json', 'data/asx-watchlist.json']) assert.ok(assets.includes(f), f);
-    assert.ok(/stockwatch-shell-v4/.test(sw) && /stockwatch-data-v4/.test(sw), 'cache version bumped');
+    assert.ok(/stockwatch-shell-v5/.test(sw) && /stockwatch-data-v4/.test(sw), 'shell cache version bumped (v5: portfolio value chart); market-data cache kept');
     for (const p of ['token', 'apikey', 'access_key']) assert.ok(sw.includes("'" + p + "'"), 'SW strips ' + p + ' before caching');
     for (const h of ['finnhub.io', 'api.twelvedata.com', 'api.marketstack.com', 'api.frankfurter.dev', 'docs.google.com']) assert.ok(sw.includes("'" + h + "'"), 'SW knows API host ' + h);
     assert.ok(/new Request\(a, \{ cache: 'reload' \}\)/.test(sw), 'install fetches the shell fresh (cache: reload), not from the HTTP cache');
@@ -77,6 +77,16 @@ const text = files.filter(f => /\.(js|json|html|css|md|webmanifest|py|txt)$|\.gi
     const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8'), app = fs.readFileSync(path.join(ROOT, 'app.js'), 'utf8');
     for (const a of (html + app).match(/<a [^>]*href="(https|\$\{)[^>]*>/g) || []) assert.ok(/target="_blank"/.test(a) && /rel="noopener noreferrer"/.test(a), a);
     assert.ok(/background push[\s\S]{0,80}needs a server/i.test(html), 'honest note about background push');
+  });
+  await test('portfolio value chart: built from data already on the device (no fetch, no key value read); history holds no names or keys', () => {
+    const app = fs.readFileSync(path.join(ROOT, 'app.js'), 'utf8');
+    const start = app.indexOf('/* ---------- portfolio value chart'), end = app.indexOf('function loadPortfolio(');
+    assert.ok(start > 0 && end > start, 'chart section found');
+    const code = app.slice(start, end);
+    assert.ok(!/src\.(quote|candles|asxHistory|asxQuotes|sheetQuotes|fx|sparklines|news|profile|metrics)\(/.test(code), 'chart code only peeks at the cache');
+    assert.ok(!/fetch\(|getKeys|keys\.|KEYS\.apiKeys/.test(code), 'chart code never reads a key value (hasKey only picks the hint wording)');
+    const L = require(path.join(ROOT, 'logic.js'));
+    assert.ok(/^stockwatch\.pfvalue\.v1$/.test(L.KEYS.valueHistory) && !L.KEYS.valueHistory.startsWith(L.CACHE_PREFIX), 'history lives in its own localStorage key, outside the market-data cache');
   });
   await test('footer says Not financial advice and the delayed-data label exists', () => {
     const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');

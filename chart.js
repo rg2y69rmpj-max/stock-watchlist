@@ -11,7 +11,8 @@
     const ctx = canvas.getContext('2d');
     let bars = [], meta = {}, hover = -1;
     const pad = { l: 6, r: 54, t: 14, b: 24 };
-    const fmtY = v => v >= 1000 ? v.toFixed(0) : v >= 100 ? v.toFixed(1) : v.toFixed(2);
+    const fmtY = opts.formatY || (v => v >= 1000 ? v.toFixed(0) : v >= 100 ? v.toFixed(1) : v.toFixed(2));
+    const dayMs = d => Date.parse(d.slice(0, 10) + 'T00:00:00Z');
     function xLabel(d) {
       if (meta.intraday) { const m = /(\d{2}):(\d{2})/.exec(d); if (!m) return d; let h = +m[1]; const ap = h >= 12 ? 'p' : 'a'; h = h % 12 || 12; return meta.range === '5D' ? d.slice(5, 10).replace('-', '/') : h + ':' + m[2] + ap; }
       const [y, mo, da] = d.slice(0, 10).split('-'); const M = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][+mo - 1];
@@ -28,7 +29,10 @@
       if (meta.baseline != null) { lo = Math.min(lo, meta.baseline); hi = Math.max(hi, meta.baseline); }
       const padV = (hi - lo) * 0.08 || hi * 0.01 || 1; lo -= padV; hi += padV;
       const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
-      return { w, h, lo, hi, pw, ph, x: i => pad.l + (bars.length < 2 ? pw / 2 : i * pw / (bars.length - 1)), y: v => pad.t + ph * (1 - (v - lo) / (hi - lo)) };
+      // meta.timeX: x spaced by calendar date (gaps in the data stay visible as gaps); default: evenly by index.
+      const t0 = meta.timeX && bars.length > 1 ? dayMs(bars[0].d) : 0, tSpan = meta.timeX && bars.length > 1 ? (dayMs(bars[bars.length - 1].d) - t0) || 1 : 0;
+      const x = meta.timeX && bars.length > 1 ? i => pad.l + (dayMs(bars[i].d) - t0) / tSpan * pw : i => pad.l + (bars.length < 2 ? pw / 2 : i * pw / (bars.length - 1));
+      return { w, h, lo, hi, pw, ph, x, y: v => pad.t + ph * (1 - (v - lo) / (hi - lo)) };
     }
     function draw() {
       const { w, h } = size(); ctx.clearRect(0, 0, w, h);
@@ -44,18 +48,20 @@
       }
       ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
       [0, Math.floor((bars.length - 1) / 2), bars.length - 1].forEach((i, k) => {
-        ctx.textAlign = k === 0 ? 'left' : k === 2 ? 'right' : 'center'; ctx.fillStyle = COLORS.text; ctx.fillText(xLabel(bars[i].d), k === 2 ? g.w - pad.r : g.x(i), g.h - 6);
+        if (k === 1 && (i === 0 || i === bars.length - 1 || g.x(i) - pad.l < 70 || g.w - pad.r - g.x(i) < 70)) return; // no middle label crowding the ends
+        ctx.textAlign = k === 0 ? 'left' : k === 2 ? 'right' : 'center'; ctx.fillStyle = COLORS.text; ctx.fillText(xLabel(bars[i].d), k === 2 ? g.w - pad.r : k === 0 ? pad.l : g.x(i), g.h - 6);
       });
       if (meta.baseline != null) { const y = g.y(meta.baseline); ctx.setLineDash([3, 4]); ctx.strokeStyle = COLORS.base; ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(g.w - pad.r, y); ctx.stroke(); ctx.setLineDash([]); }
       const grad = ctx.createLinearGradient(0, pad.t, 0, g.h - pad.b); grad.addColorStop(0, up ? 'rgba(34,197,94,0.28)' : 'rgba(240,82,82,0.28)'); grad.addColorStop(1, 'rgba(0,0,0,0)');
       ctx.beginPath(); bars.forEach((b, i) => i ? ctx.lineTo(g.x(i), g.y(b.c)) : ctx.moveTo(g.x(i), g.y(b.c)));
       ctx.lineTo(g.x(bars.length - 1), g.h - pad.b); ctx.lineTo(g.x(0), g.h - pad.b); ctx.closePath(); ctx.fillStyle = grad; ctx.fill();
       ctx.beginPath(); bars.forEach((b, i) => i ? ctx.lineTo(g.x(i), g.y(b.c)) : ctx.moveTo(g.x(i), g.y(b.c))); ctx.strokeStyle = col; ctx.lineWidth = 1.8; ctx.lineJoin = 'round'; ctx.stroke();
+      if (meta.dots && bars.length <= 60) { ctx.fillStyle = col; bars.forEach((b, i) => { ctx.beginPath(); ctx.arc(g.x(i), g.y(b.c), b.hollow ? 2.2 : 3, 0, Math.PI * 2); if (b.hollow) { ctx.strokeStyle = col; ctx.lineWidth = 1.4; ctx.stroke(); } else ctx.fill(); }); }
       if (hover >= 0 && hover < bars.length) {
         const b = bars[hover], x = g.x(hover), y = g.y(b.c);
         ctx.strokeStyle = COLORS.cross; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, g.h - pad.b); ctx.moveTo(pad.l, y); ctx.lineTo(g.w - pad.r, y); ctx.stroke();
         ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill(); ctx.strokeStyle = '#0b0f14'; ctx.lineWidth = 2; ctx.stroke();
-        const label = '$' + b.c.toFixed(2) + '  ' + (opts.formatTime ? opts.formatTime(b.d, meta.intraday) : b.d);
+        const label = opts.formatTip ? opts.formatTip(b) : '$' + b.c.toFixed(2) + '  ' + (opts.formatTime ? opts.formatTime(b.d, meta.intraday) : b.d);
         ctx.font = '600 12px -apple-system, system-ui, sans-serif'; const tw = ctx.measureText(label).width + 14;
         const bx = Math.min(Math.max(x - tw / 2, pad.l), g.w - pad.r - tw);
         ctx.fillStyle = 'rgba(15,20,28,0.92)'; ctx.strokeStyle = 'rgba(148,163,184,0.35)'; ctx.lineWidth = 1;
@@ -66,8 +72,9 @@
     function setHover(clientX) {
       if (bars.length < 2) return;
       const r = canvas.getBoundingClientRect(), g = geom();
-      const i = Math.round(((clientX - r.left) - pad.l) / g.pw * (bars.length - 1));
-      const ni = Math.max(0, Math.min(bars.length - 1, i));
+      let ni;
+      if (meta.timeX) { const px = clientX - r.left; ni = 0; bars.forEach((b, i) => { if (Math.abs(g.x(i) - px) < Math.abs(g.x(ni) - px)) ni = i; }); }
+      else ni = Math.max(0, Math.min(bars.length - 1, Math.round(((clientX - r.left) - pad.l) / g.pw * (bars.length - 1))));
       if (ni !== hover) { hover = ni; draw(); if (opts.onHover) opts.onHover(bars[hover], hover); }
     }
     function clearHover() { if (hover !== -1) { hover = -1; draw(); if (opts.onHover) opts.onHover(null, -1); } }

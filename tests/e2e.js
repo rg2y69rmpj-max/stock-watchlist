@@ -259,6 +259,19 @@ const visible = (p, sel) => p.$eval(sel, e => !e.hidden && !e.closest('[hidden]'
     await d.waitForFunction(() => document.querySelector('#pfValue').textContent.startsWith('A$') && /DEMO rate/.test(document.querySelector('#pfFx').textContent) && document.querySelector('#pfPrompt').hidden);
     ok((await text(d, '#pfNote')).includes('DEMO') && (await d.$$eval('[data-weight]', e => e.filter(x => x.textContent).length)) === 4, 'DEMO portfolio: values, weights and FX labelled DEMO');
     await d.evaluate(() => window.scrollTo(0, 0)); await shot('2-portfolio-demo.png', true);
+    // portfolio value chart (DEMO): synthetic closes × the typed units, labelled DEMO, nothing saved to the real history
+    await d.waitForFunction(() => window.__app.pfChart.data().length > 200);
+    const dAll = await d.evaluate(() => window.__app.pfChart.data().length);
+    ok(await visible(d, '#pfChartBadge') && (await text(d, '#pfChartNote')).includes('DEMO') && (await text(d, '#pfChartNow')) === (await text(d, '#pfValue')) && /^[+−]A\$/.test(await text(d, '#pfChartChange')) && /^Now vs /.test(await text(d, '#pfChartStart')),
+      'DEMO value chart: ' + dAll + ' daily points, current total vs start shown, labelled DEMO: ' + (await text(d, '#pfChartHead')).replace(/\s+/g, ' '));
+    ok(await d.evaluate(() => localStorage.getItem('stockwatch.pfvalue.v1')) === null, 'DEMO totals are never saved to the chart history');
+    await tap(d, '#pfRanges [data-pfrange="1M"]'); await d.waitForFunction(n => window.__app.pfChart.data().length < n, {}, dAll);
+    const d1m = await d.evaluate(() => window.__app.pfChart.data());
+    ok(d1m.length >= 15 && d1m.length <= 24 && (Date.parse(d1m[d1m.length - 1].d) - Date.parse(d1m[0].d)) / 864e5 <= 31 && await d.$eval('#pfRanges [data-pfrange="1M"]', b => b.classList.contains('on')), '1M range: last month of daily points (' + d1m.length + ')');
+    await tap(d, '#pfRanges [data-pfrange="All"]');
+    const pb = await (await d.$('#pfChart')).boundingBox();
+    await d.touchscreen.touchStart(pb.x + pb.width * 0.5, pb.y + pb.height / 2); await sleep(150);
+    ok(/^A\$[\d,]+\.\d\d · .+ · DEMO$/.test(await text(d, '#pfChartTip')), 'touching the value chart shows value and date: ' + await text(d, '#pfChartTip')); await d.touchscreen.touchEnd();
     // alerts
     await d.click('#tabAlerts'); await d.waitForSelector('#v-alerts:not([hidden])');
     const px = await d.evaluate(() => ({ nvda: window.__app.src.peekQuote('NVDA').price, msft: window.__app.src.peekQuote('MSFT').price, bhp: window.__app.src.peekAsxQuote('BHP').price }));
@@ -359,6 +372,9 @@ const visible = (p, sel) => p.$eval(sel, e => !e.hidden && !e.closest('[hidden]'
     const weights = (await q.$$eval('[data-weight]', e => e.map(x => x.textContent))).filter(Boolean).map(parseFloat);
     ok(Math.abs(weights.reduce((a, b) => a + b, 0) - 100) < 0.3 && Math.abs(weights[0] - fangV / (fangV + aaplV) * 100) < 0.06, 'weights per holding add up to 100%: ' + weights.join(', '));
     ok((await text(q, '#pfDay')) !== '—', 'today\u2019s change shown: ' + await text(q, '#pfDay'));
+    const qHist = await q.evaluate(() => JSON.parse(localStorage.getItem('stockwatch.pfvalue.v1') || 'null'));
+    ok(qHist && qHist.days.length === 1 && Math.abs(qHist.days[0].v - (fangV + aaplV)) < 0.011 && qHist.days[0].sig === 'AAPL=2,ASX:FANG=10' && await q.evaluate(() => window.__app.pfChart.data().length) >= 1 && (await text(q, '#pfChartNow')) === (await text(q, '#pfValue')),
+      'live total saved once for today (AUD, ticker=units only) and charted: ' + JSON.stringify(qHist && qHist.days.map(x => [x.d, x.v, x.pc])));
     await tap(q, '#pfAddBtn'); await q.type('#pfForm [name=symbol]', 'AAPL'); await q.select('#pfForm [name=exchange]', 'US'); await tap(q, '#pfForm button[type=submit]');
     ok((await text(q, '#pfMsg')).includes('already'), 'duplicate holding refused'); await tap(q, '#pfCancel');
     await dbg('portfolio-live');
@@ -474,6 +490,17 @@ const visible = (p, sel) => p.$eval(sel, e => !e.hidden && !e.closest('[hidden]'
     await g.type('#pfForm [name=units]', '100'); await g.type('#pfForm [name=avgCost]', '20'); await tap(g, '#pfForm button[type=submit]');
     await g.waitForFunction(() => document.querySelector('#pfValue').textContent.startsWith('A$'), { timeout: TIMEOUT });
     ok(gm(await text(g, '#pfValue')) === +(100 * fp.price).toFixed(2) && !(await text(g, '#pfList')).includes(' close') && (await text(g, '#pfNote')).includes('Google Finance'), 'portfolio values FANG at the sheet price: ' + await text(g, '#pfValue'));
+    // value chart on the first day with only a Google Sheet: previous close → now, labelled honestly, no extra requests
+    const reqBefore = apiLog.length; await sleep(800);
+    const gBars = await g.evaluate(() => window.__app.pfChart.data()), gHist = await g.evaluate(() => JSON.parse(localStorage.getItem('stockwatch.pfvalue.v1') || 'null'));
+    ok(gBars.length === 2 && gBars[0].src === 'prev' && gBars[0].c === +(100 * fp.prev).toFixed(2) && gBars[1].c === +(100 * fp.price).toFixed(2) && gBars[1].d === '2026-10-08' && gBars[0].d === '2026-10-07',
+      'first-day value chart: previous close then the sheet total, dated by the sheet\u2019s trade date: ' + JSON.stringify(gBars.map(b => [b.d, b.c, b.src])));
+    ok(gHist && gHist.days.length === 1 && gHist.days[0].d === '2026-10-08' && gHist.days[0].pc === +(100 * fp.prev).toFixed(2), 'sheet total and previous close saved on this device for the chart');
+    const gHead = await text(g, '#pfChartHead'), gRange = await text(g, '#pfChartRange'), gNote = await text(g, '#pfChartNote');
+    ok(/vs .*\(previous close\)/.test(gHead) && gRange.includes('2 daily points') && gRange.includes('all the history on this device') && /can\u2019t share past prices/.test(gNote) && /Hollow dots: the previous close/.test(gNote) && await g.$eval('#pfChartBadge', e => e.hidden),
+      'thin history is labelled as such: ' + gRange);
+    ok(await g.$$eval('#pfRanges button', bs => bs.filter(b => b.disabled).map(b => b.dataset.pfrange).join()) === '3M,1Y' && !apiLog.slice(reqBefore).some(a => a.host !== 'docs.google.com' && a.host !== 'doc-0s-sheets.googleusercontent.com'),
+      'ranges longer than the history are disabled; the chart made no requests and needed no key');
     await g.click('#tabAlerts'); await g.waitForSelector('#v-alerts:not([hidden])');
     await g.$eval('#alForm [name=sym]', e => { e.value = ''; }); await g.type('#alForm [name=sym]', 'FANG'); await g.select('#alForm [name=market]', 'ASX'); await g.select('#alForm [name=type]', 'below');
     await g.type('#alForm [name=value]', String(Math.ceil(fp.price + 1))); await tap(g, '#alForm button[type=submit]'); await sleep(500);
@@ -544,7 +571,7 @@ const visible = (p, sel) => p.$eval(sel, e => !e.hidden && !e.closest('[hidden]'
     // ---------- service worker ----------
     const ctx3 = await browser.createBrowserContext(); const s = await newPage(ctx3, { bypassSW: false });
     await s.goto(BASE, { waitUntil: 'networkidle0' });
-    const swOk = await s.evaluate(async () => { const reg = await navigator.serviceWorker.ready; const ks = await caches.keys(); const c = await caches.open('stockwatch-shell-v4'); return { active: !!reg.active, ks, idx: !!(await c.match('index.html')), list: !!(await c.match('data/default-watchlist.json')) && !!(await c.match('data/asx-watchlist.json')) }; });
+    const swOk = await s.evaluate(async () => { const reg = await navigator.serviceWorker.ready; const ks = await caches.keys(); const c = await caches.open('stockwatch-shell-v5'); return { active: !!reg.active, ks, idx: !!(await c.match('index.html')), list: !!(await c.match('data/default-watchlist.json')) && !!(await c.match('data/asx-watchlist.json')) }; });
     ok(swOk.active && swOk.idx && swOk.list, 'service worker active and app shell cached: ' + swOk.ks.join());
     await s.setOfflineMode(true); await s.reload({ waitUntil: 'domcontentloaded' });
     ok(await s.$('#v-setup') !== null, 'app shell loads offline from the cache');

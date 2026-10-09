@@ -483,5 +483,66 @@ const defaults = require('../data/default-watchlist.json');
     assert.ok(Math.abs(sum.total.value - 7283.4) < 1e-6 && Math.abs(sum.total.gain - 1333.4) < 1e-6, 'total ' + sum.total.value);
     assert.strictEqual(row('FANG').dayChange, null, 'no previous close column: today\'s change left blank, not guessed');
   });
+  await test('value history: one complete snapshot per day, previous close kept, DEMO and incomplete totals never saved', () => {
+    const st = memStorage();
+    const pf = L.defaultPortfolio(); L.updateHolding(pf, 'ASX:FANG', { units: 100, avgCost: 30 }); L.updateHolding(pf, 'ASX:SEMI', { units: 50, avgCost: 35 });
+    const q = { 'ASX:FANG': { price: 38, change: -0.5, changePct: -1.3, date: '2026-10-09' }, 'ASX:SEMI': { price: 40, change: 1, changePct: 2.5, date: '2026-10-09' } };
+    const sum = L.portfolioSummary(pf.holdings, id => q[id], null);
+    assert.strictEqual(L.snapshotDate([q['ASX:FANG'], q['ASX:SEMI']], '2026-10-11'), '2026-10-09', 'a weekend load files the value under the last trade date');
+    assert.strictEqual(L.snapshotDate([{ price: 1 }], '2026-10-11'), '2026-10-11', 'no trade date: today');
+    assert.strictEqual(L.recordValueSnapshot(st, sum, pf.holdings, { date: '2026-10-09', demo: true }), null, 'DEMO never saved');
+    assert.strictEqual(st.getItem(L.KEYS.valueHistory), null);
+    const e = L.recordValueSnapshot(st, sum, pf.holdings, { date: '2026-10-09', t: 1 });
+    assert.strictEqual(e.v, 5800); assert.strictEqual(e.pc, 5800 - (-50 + 50)); assert.strictEqual(e.sig, 'ASX:FANG=100,ASX:SEMI=50');
+    q['ASX:FANG'].price = 39; L.recordValueSnapshot(st, L.portfolioSummary(pf.holdings, id => q[id], null), pf.holdings, { date: '2026-10-09', t: 2 });
+    let h = L.loadValueHistory(st); assert.strictEqual(h.days.length, 1, 'same day replaced, not duplicated'); assert.strictEqual(h.days[0].v, 5900);
+    const missing = L.portfolioSummary(pf.holdings, id => (id === 'ASX:SEMI' ? null : q[id]), null);
+    assert.strictEqual(L.recordValueSnapshot(st, missing, pf.holdings, { date: '2026-10-12' }), null, 'a holding without a price: not saved (would look like a crash)');
+    const pfUs = { holdings: [{ id: 'AAPL', symbol: 'AAPL', exchange: 'US', units: 2, avgCost: 100 }] };
+    assert.strictEqual(L.recordValueSnapshot(st, L.portfolioSummary(pfUs.holdings, () => ({ price: 200, change: 1 }), null), pfUs.holdings, { date: '2026-10-12' }), null, 'no FX rate: not saved');
+    L.recordValueSnapshot(st, L.portfolioSummary(pf.holdings, id => ({ ...q[id], change: null }), null), pf.holdings, { date: '2026-10-12' });
+    h = L.loadValueHistory(st); assert.deepStrictEqual(h.days.map(x => x.d), ['2026-10-09', '2026-10-12']); assert.strictEqual(h.days[1].pc, null, 'no day change: no previous close invented');
+    st.setItem(L.KEYS.valueHistory, '{bad'); assert.deepStrictEqual(L.loadValueHistory(st).days, [], 'damaged history ignored');
+  });
+
+  await test('value history: capped, stored without keys or names beyond ticker=units', () => {
+    const st = memStorage(), pf = { holdings: [{ id: 'ASX:IVV', symbol: 'IVV', exchange: 'ASX', units: 1, avgCost: null }] };
+    for (let i = 0; i < L.VALUE_HISTORY_MAX + 5; i++) {
+      const d = new Date(Date.UTC(2023, 0, 1) + i * L.DAY).toISOString().slice(0, 10);
+      L.recordValueSnapshot(st, L.portfolioSummary(pf.holdings, () => ({ price: 50 + i % 7, change: 0.1 }), null), pf.holdings, { date: d, t: i });
+    }
+    const raw = st.getItem(L.KEYS.valueHistory), h = JSON.parse(raw);
+    assert.strictEqual(h.days.length, L.VALUE_HISTORY_MAX); assert.ok(h.days[0].d > '2023-01-01', 'oldest dropped first');
+    assert.deepStrictEqual(Object.keys(h.days[0]).sort(), ['d', 'pc', 'sig', 't', 'v']);
+  });
+
+  await test('backfill: cached closes × today\u2019s units, forward-filled across calendars, all-or-nothing', () => {
+    const hs = [{ id: 'ASX:FANG', symbol: 'FANG', exchange: 'ASX', units: 10 }, { id: 'AAPL', symbol: 'AAPL', exchange: 'US', units: 2 }, { id: 'ASX:IVV', symbol: 'IVV', exchange: 'ASX', units: 0 }];
+    const bars = { FANG: [{ d: '2026-10-05', c: 10 }, { d: '2026-10-06', c: 11 }, { d: '2026-10-08', c: 12 }], AAPL: [{ d: '2026-10-06 00:00:00', c: 100 }, { d: '2026-10-07', c: 110 }] };
+    const r = L.backfillValues(hs, h => bars[h.symbol], { rate: 1.5 });
+    assert.deepStrictEqual(r.missing, []);
+    assert.deepStrictEqual(r.points.map(p => [p.d, p.v]), [['2026-10-06', 410], ['2026-10-07', 440], ['2026-10-08', 450]], 'starts when every holding has a close; gaps carry the last close');
+    assert.deepStrictEqual(L.backfillValues(hs, h => (h.symbol === 'AAPL' ? null : bars[h.symbol]), { rate: 1.5 }), { points: [], missing: ['AAPL'] }, 'one holding without closes: nothing rebuilt');
+    assert.deepStrictEqual(L.backfillValues(hs, h => bars[h.symbol], null).missing, ['AAPL'], 'US needs an FX rate');
+    assert.deepStrictEqual(L.backfillValues([], () => [], null), { points: [], missing: [] });
+  });
+
+  await test('value series: saved days beat rebuilt ones, previous close fills the day before, range + honest change', () => {
+    const backfill = [{ d: '2026-09-01', v: 900 }, { d: '2026-10-07', v: 990 }, { d: '2026-10-08', v: 995 }];
+    const snaps = [{ d: '2026-10-08', v: 1000, pc: 980, sig: 'a' }, { d: '2026-10-12', v: 1010, pc: 1005, sig: 'a' }];
+    const s = L.buildValueSeries({ snapshots: snaps, backfill, current: { d: '2026-10-12', v: 1020, sig: 'a' }, range: 'All' });
+    assert.deepStrictEqual(s.points.map(p => p.d + ':' + p.v + ':' + p.src), ['2026-09-01:900:eod', '2026-10-07:990:eod', '2026-10-08:1000:snap', '2026-10-09:1005:prev', '2026-10-12:1020:now'],
+      'snapshot replaces the rebuilt close; the prev close of Mon fills Fri; a rebuilt close is not overwritten by a prev close; live total is last');
+    assert.strictEqual(s.change, 120); assert.ok(Math.abs(s.changePct - 120 / 9) < 1e-9); assert.strictEqual(s.available.from, '2026-09-01'); assert.strictEqual(s.holdingsChanged, false);
+    const m = L.buildValueSeries({ snapshots: snaps, backfill, current: null, range: '1M' });
+    assert.strictEqual(m.points[0].d, '2026-10-07', '1M counts back from the last point'); assert.strictEqual(m.available.from, '2026-09-01');
+    const first = L.buildValueSeries({ snapshots: [{ d: '2026-10-09', v: 7283.4, pc: 7377.1, sig: 'x' }], backfill: [], range: 'All' });
+    assert.deepStrictEqual(first.points.map(p => p.src), ['prev', 'snap'], 'first day: previous close → now (two honest points)'); assert.strictEqual(first.points[0].d, '2026-10-08');
+    assert.strictEqual(L.buildValueSeries({ snapshots: [{ d: '2026-10-09', v: 5, pc: null }], range: 'All' }).change, null, 'one point: no change claimed');
+    assert.strictEqual(L.buildValueSeries({ snapshots: [{ d: '2026-10-08', v: 5, sig: 'a' }, { d: '2026-10-09', v: 9, sig: 'b' }], range: 'All' }).holdingsChanged, true, 'holdings changed is flagged');
+    assert.strictEqual(L.buildValueSeries({ snapshots: [], backfill: [], range: '1Y' }).points.length, 0);
+    assert.strictEqual(L.prevWeekday('2026-10-12'), '2026-10-09'); assert.strictEqual(L.prevWeekday('2026-10-07'), '2026-10-06');
+    assert.deepStrictEqual(L.PF_RANGE_ORDER, ['1M', '3M', '1Y', 'All']);
+  });
   summary('logic');
 })();

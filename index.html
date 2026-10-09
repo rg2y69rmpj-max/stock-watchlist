@@ -132,6 +132,15 @@
       <div id="pfFx" class="small muted"></div>
       <div id="pfNote" class="small muted"></div>
     </div>
+    <div id="pfChartCard" class="card pf-chart">
+      <div class="pf-chart-top"><h2>Value over time <span class="muted small">AUD</span></h2><span id="pfChartBadge" class="badge demo" hidden>DEMO</span></div>
+      <div id="pfChartHead" class="pf-chart-head"></div>
+      <div id="pfChartTip" class="tip small">Touch and drag on the chart to see the value on each day</div>
+      <div class="chart-wrap"><canvas id="pfChart" aria-label="Portfolio value chart"></canvas></div>
+      <div id="pfRanges" class="ranges pf-ranges" role="tablist"></div>
+      <div id="pfChartRange" class="small muted"></div>
+      <div id="pfChartNote" class="small muted"></div>
+    </div>
     <div class="toolbar"><span class="muted small grow">Holdings · tap to edit</span><button id="pfRefresh" class="chip" type="button" aria-label="Refresh portfolio">↻</button><button id="pfAddBtn" class="chip accent" type="button">＋ Holding</button></div>
     <form id="pfForm" class="card pf-form" hidden autocomplete="off">
       <h2 id="pfFormTitle">Add holding</h2>
